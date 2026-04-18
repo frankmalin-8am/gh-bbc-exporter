@@ -47,20 +47,23 @@ type BitbucketPRResponse struct {
 }
 
 type BitbucketPR struct {
-	ID                int                 `json:"id"`
-	Title             string              `json:"title"`
-	Description       *string             `json:"description"`
-	State             string              `json:"state"`
-	CreatedOn         string              `json:"created_on"`
-	UpdatedOn         string              `json:"updated_on"`
-	Draft             bool                `json:"draft"`
-	CommentCount      int                 `json:"comment_count"`
-	CloseSourceBranch bool                `json:"close_source_branch"`
-	Source            BitbucketPREndpoint `json:"source"`
-	Destination       BitbucketPREndpoint `json:"destination"`
-	MergeCommit       *BitbucketCommit    `json:"merge_commit"`
-	Author            BitbucketPRUser     `json:"author"`
-	ClosedBy          *BitbucketPRUser    `json:"closed_by"`
+	ID                int                   `json:"id"`
+	Title             string                `json:"title"`
+	Description       *string               `json:"description"`
+	State             string                `json:"state"`
+	CreatedOn         string                `json:"created_on"`
+	UpdatedOn         string                `json:"updated_on"`
+	Draft             bool                  `json:"draft"`
+	CommentCount      int                   `json:"comment_count"`
+	CloseSourceBranch bool                  `json:"close_source_branch"`
+	Source            BitbucketPREndpoint   `json:"source"`
+	Destination       BitbucketPREndpoint   `json:"destination"`
+	MergeCommit       *BitbucketCommit      `json:"merge_commit"`
+	Author            BitbucketPRUser       `json:"author"`
+	ClosedBy          *BitbucketPRUser      `json:"closed_by"`
+	// Participants is embedded in the PR response and is the most reliable
+	// source for approval data — no separate API call required.
+	Participants      []BitbucketParticipant `json:"participants"`
 }
 
 type BitbucketPREndpoint struct {
@@ -136,4 +139,17 @@ type Inline struct {
 	From *int   `json:"from"`
 	To   *int   `json:"to"`
 	Path string `json:"path"`
+}
+
+type BitbucketParticipant struct {
+	User              BitbucketPRUser `json:"user"`
+	Role              string          `json:"role"`
+	Approved          bool            `json:"approved"`
+	State             string          `json:"state"` // "approved", "changes_requested", "needs_work", null
+	ParticipatedOn    string          `json:"participated_on"`
+}
+
+type BitbucketParticipantsResponse struct {
+	Values []BitbucketParticipant `json:"values"`
+	Next   string                 `json:"next"`
 }

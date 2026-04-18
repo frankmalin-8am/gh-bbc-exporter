@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -173,32 +174,77 @@ func (e *Exporter) Export(workspace, repoSlug string) error {
 			zap.Int("regular_comments", len(regularComments)),
 			zap.Int("review_comments", len(reviewComments)),
 			zap.Int("total_comments", len(regularComments)+len(reviewComments)))
-		if len(regularComments) > 0 {
-			if err := e.writeJSONFile("issue_comments_000001.json", regularComments); err != nil {
-				e.logger.Warn("Failed to write issue comments", zap.Error(err))
-			} else {
-				e.logger.Debug("Issue comments written", zap.Int("count", len(regularComments)))
-			}
+		// Issue comments: merge PR conversation comments + approval fallback comments.
+		// approvalIssueComments is populated later (after GetPullRequestApprovals),
+		// so we collect all issue comments into a single slice and write once below.
+		allIssueComments := regularComments
+
+		// Fetch approval reviews, synthetic review comments, and issue-comment fallbacks.
+		// The synthetic review comment is included because GEI may drop pull_request_reviews
+		// that have no linked pull_request_review_comment.  The issue comment fallback
+		// ensures the approval is visible even if the review import fails.
+		approvalReviews, approvalComments, approvalIssueComments, approvalErr := e.client.GetPullRequestApprovals(workspace, repoSlug, prs)
+		if approvalErr != nil {
+			e.logger.Warn("Failed to fetch PR approvals", zap.Error(approvalErr))
 		}
 
-		if len(reviewComments) > 0 {
-			if err := e.writeJSONFile("pull_request_review_comments_000001.json", reviewComments); err != nil {
+		// Merge real inline review comments with synthetic approval comments.
+		// allReviewComments drives both the file write and thread creation.
+		allReviewComments := append(reviewComments, approvalComments...)
+
+		if len(allReviewComments) > 0 {
+			if err := e.writeJSONFile("pull_request_review_comments_000001.json", allReviewComments); err != nil {
 				e.logger.Warn("Failed to write pull request review comments", zap.Error(err))
 			} else {
-				e.logger.Debug("Pull request review comments written", zap.Int("count", len(reviewComments)))
+				e.logger.Debug("Pull request review comments written",
+					zap.Int("inline", len(reviewComments)),
+					zap.Int("approval_synthetic", len(approvalComments)),
+					zap.Int("total", len(allReviewComments)))
 			}
 
-			threads := e.createReviewThreads(reviewComments)
+			threads := e.createReviewThreads(allReviewComments)
 			if err := e.writeJSONFile("pull_request_review_threads_000001.json", threads); err != nil {
 				e.logger.Warn("Failed to write review threads", zap.Error(err))
 			}
+		}
 
-			reviews := e.createReviews(reviewComments)
+		// Build reviews: COMMENTED reviews come only from real inline comments so
+		// we don't create a duplicate COMMENTED review for the approval review URL.
+		// APPROVED reviews come from approvalReviews.
+		reviews := e.createReviews(reviewComments)
+		if approvalErr == nil {
+			reviews = append(reviews, approvalReviews...)
+			e.logger.Debug("Approval reviews merged",
+				zap.Int("approval_count", len(approvalReviews)),
+				zap.Int("total_reviews", len(reviews)))
+		}
+
+		if len(reviews) > 0 {
 			if err := e.writeJSONFile("pull_request_reviews_000001.json", reviews); err != nil {
 				e.logger.Warn("Failed to write reviews", zap.Error(err))
 			}
 		}
+
+		// Write all issue comments: regular PR conversation comments + approval fallbacks.
+		if approvalErr == nil {
+			allIssueComments = append(allIssueComments, approvalIssueComments...)
+		}
+		if len(allIssueComments) > 0 {
+			if err := e.writeJSONFile("issue_comments_000001.json", allIssueComments); err != nil {
+				e.logger.Warn("Failed to write issue comments", zap.Error(err))
+			} else {
+				e.logger.Debug("Issue comments written",
+					zap.Int("regular", len(regularComments)),
+					zap.Int("approval_fallbacks", len(approvalIssueComments)),
+					zap.Int("total", len(allIssueComments)))
+			}
+		}
 	}
+
+	// Ensure every user URL referenced in PR/comment/review data has an entry in
+	// users_000001.json.  This catches both workspace-member API failures and external
+	// collaborators (reviewers who are not workspace members).
+	e.backfillMissingUsers()
 
 	if err := e.validateExportData(); err != nil {
 		e.logger.Warn("Export validation issues detected", zap.Error(err))
@@ -683,6 +729,11 @@ func (e *Exporter) createReviews(comments []data.PullRequestReviewComment) []map
 
 		comment := reviewComments[0]
 
+		// Inline code review comment groups always map to "COMMENTED".
+		// The integer State field on PullRequestReviewComment is a GEI lifecycle
+		// value (1 = active) that has no relation to approval/changes-requested
+		// semantics.  Approvals are captured separately by GetPullRequestApprovals
+		// and appended to the reviews list after this function returns.
 		review := map[string]interface{}{
 			"type":         "pull_request_review",
 			"url":          reviewURL,
@@ -691,7 +742,7 @@ func (e *Exporter) createReviews(comments []data.PullRequestReviewComment) []map
 			"body":         nil,
 			"head_sha":     comment.CommitID,
 			"formatter":    "markdown",
-			"state":        comment.State,
+			"state":        1, // GEI integer: 1=COMMENTED, 2=APPROVED, 3=CHANGES_REQUESTED
 			"reactions":    []interface{}{},
 			"created_at":   comment.CreatedAt,
 			"submitted_at": comment.CreatedAt,
@@ -701,6 +752,98 @@ func (e *Exporter) createReviews(comments []data.PullRequestReviewComment) []map
 	}
 
 	return reviews
+}
+
+// backfillMissingUsers scans every JSON file in the export directory for "user" fields
+// that reference a Bitbucket user URL.  Any URL not already present in users_000001.json
+// gets a stub entry added so GEI can resolve the reference during import.
+// This handles two cases:
+//   - The workspace/members API returned an error and all real users were dropped
+//   - External collaborators who are not workspace members (e.g. reviewers from another org)
+func (e *Exporter) backfillMissingUsers() {
+	usersPath := filepath.Join(e.outputDir, "users_000001.json")
+
+	// Load (or initialise) the current users list
+	var users []data.User
+	if raw, err := os.ReadFile(usersPath); err == nil {
+		if err := json.Unmarshal(raw, &users); err != nil {
+			e.logger.Warn("backfillMissingUsers: failed to parse users file", zap.Error(err))
+			return
+		}
+	}
+
+	// Build a set of already-known user URLs
+	known := make(map[string]bool, len(users))
+	for _, u := range users {
+		known[u.URL] = true
+	}
+
+	// Scan every *.json file (except users_000001.json itself) for user-field values
+	entries, err := os.ReadDir(e.outputDir)
+	if err != nil {
+		e.logger.Warn("backfillMissingUsers: failed to read output dir", zap.Error(err))
+		return
+	}
+
+	userURLPattern := regexp.MustCompile(`^https://bitbucket\.org/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || entry.Name() == "users_000001.json" {
+			continue
+		}
+
+		raw, err := os.ReadFile(filepath.Join(e.outputDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+
+		var records []map[string]interface{}
+		if err := json.Unmarshal(raw, &records); err != nil {
+			continue
+		}
+
+		for _, rec := range records {
+			for _, key := range []string{"user", "assignee", "resolver"} {
+				val, ok := rec[key]
+				if !ok {
+					continue
+				}
+				url, ok := val.(string)
+				if !ok || known[url] || !userURLPattern.MatchString(url) {
+					continue
+				}
+				// Extract UUID from the URL as the login
+				parts := strings.Split(url, "/")
+				uuid := parts[len(parts)-1]
+				users = append(users, data.User{
+					Type:      "user",
+					URL:       url,
+					Login:     uuid,
+					Name:      uuid, // real name not available without an extra API call
+					Company:   nil,
+					Website:   nil,
+					Location:  nil,
+					Emails:    []data.Email{},
+					CreatedAt: formatDateToZ(time.Now().Format(time.RFC3339)),
+				})
+				known[url] = true
+				e.logger.Debug("backfillMissingUsers: added stub user", zap.String("url", url))
+			}
+		}
+	}
+
+	// Write the updated users file only if we added entries
+	updated, err := json.Marshal(users)
+	if err != nil {
+		e.logger.Warn("backfillMissingUsers: failed to marshal users", zap.Error(err))
+		return
+	}
+	if err := os.WriteFile(usersPath, updated, 0600); err != nil {
+		e.logger.Warn("backfillMissingUsers: failed to write users file", zap.Error(err))
+		return
+	}
+
+	e.logger.Info("backfillMissingUsers: users file finalised", zap.Int("total_users", len(users)))
 }
 
 func (e *Exporter) CreateArchive() (string, error) {
