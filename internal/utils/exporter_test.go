@@ -601,12 +601,14 @@ func TestCreateReviews(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	exporter := NewExporter(&Client{}, "output", logger, false, "")
 
+	// All inline code review comments produce COMMENTED parent reviews regardless
+	// of their integer State value (which is a GEI lifecycle field, not review state).
 	reviewComments := []data.PullRequestReviewComment{
 		{
 			PullRequestReview: "https://example.com/review/1",
 			User:              "https://example.com/user/1",
 			Body:              "Looks good!",
-			State:             1, // Use int value for approved
+			State:             1, // GEI active-comment state
 			CreatedAt:         "2023-01-01T10:00:00Z",
 			UpdatedAt:         "2023-01-01T10:00:00Z",
 		},
@@ -614,7 +616,7 @@ func TestCreateReviews(t *testing.T) {
 			PullRequestReview: "https://example.com/review/1", // Same review
 			User:              "https://example.com/user/1",
 			Body:              "Additional comment",
-			State:             1, // Use int value for approved
+			State:             1,
 			CreatedAt:         "2023-01-01T11:00:00Z",
 			UpdatedAt:         "2023-01-01T11:00:00Z",
 		},
@@ -622,7 +624,7 @@ func TestCreateReviews(t *testing.T) {
 			PullRequestReview: "https://example.com/review/2", // Different review
 			User:              "https://example.com/user/2",
 			Body:              "Needs changes",
-			State:             3, // Use int value for changes_requested
+			State:             1,
 			CreatedAt:         "2023-01-02T10:00:00Z",
 			UpdatedAt:         "2023-01-02T10:00:00Z",
 		},
@@ -630,7 +632,7 @@ func TestCreateReviews(t *testing.T) {
 
 	reviews := exporter.createReviews(reviewComments)
 
-	// Should have two reviews
+	// Should have two reviews (one per unique PullRequestReview URL)
 	assert.Len(t, reviews, 2)
 
 	// Create a map to look up reviews by their review URL
@@ -640,17 +642,16 @@ func TestCreateReviews(t *testing.T) {
 		reviewsByURL[url] = review
 	}
 
-	// Verify first review (by URL)
+	// All inline comment groups produce state=1 (GEI integer for COMMENTED)
 	review1 := reviewsByURL["https://example.com/review/1"]
 	assert.NotNil(t, review1, "Should have review with URL https://example.com/review/1")
 	assert.Equal(t, "2023-01-01T10:00:00Z", review1["submitted_at"], "Should use earliest comment time")
-	assert.Equal(t, 1, review1["state"], "Should have state 1 (approved)")
+	assert.Equal(t, 1, review1["state"], "Inline comment groups produce GEI state 1 (COMMENTED)")
 
-	// Verify second review
 	review2 := reviewsByURL["https://example.com/review/2"]
 	assert.NotNil(t, review2, "Should have review with URL https://example.com/review/2")
 	assert.Equal(t, "2023-01-02T10:00:00Z", review2["submitted_at"])
-	assert.Equal(t, 3, review2["state"], "Should have state 3 (changes requested)")
+	assert.Equal(t, 1, review2["state"], "Inline comment groups produce GEI state 1 (COMMENTED)")
 }
 
 func TestArchiveDirectoryWithSpecialFiles(t *testing.T) {
@@ -709,24 +710,26 @@ func TestReviewStates(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	exporter := NewExporter(&Client{}, "output", logger, false, "")
 
-	// Create review comments with different states
+	// All inline code review comments produce COMMENTED parent reviews.
+	// The integer State on each comment is a GEI lifecycle field (1 = active)
+	// and does not affect the parent review's state integer (also 1 = COMMENTED).
 	reviewComments := []data.PullRequestReviewComment{
 		{
 			PullRequestReview: "https://example.com/review/1",
 			User:              "https://example.com/user/1",
-			State:             1, // Approved
+			State:             1,
 			CreatedAt:         "2023-01-01T10:00:00Z",
 		},
 		{
 			PullRequestReview: "https://example.com/review/2",
 			User:              "https://example.com/user/2",
-			State:             2, // Commented
+			State:             1,
 			CreatedAt:         "2023-01-02T10:00:00Z",
 		},
 		{
 			PullRequestReview: "https://example.com/review/3",
 			User:              "https://example.com/user/3",
-			State:             3, // Changes requested
+			State:             1,
 			CreatedAt:         "2023-01-03T10:00:00Z",
 		},
 	}
@@ -734,25 +737,23 @@ func TestReviewStates(t *testing.T) {
 	// Create reviews from the comments
 	reviews := exporter.createReviews(reviewComments)
 
-	// Verify we have the correct number of reviews
+	// Verify we have one review per unique PullRequestReview URL
 	assert.Len(t, reviews, 3)
 
-	// Create a map to look up reviews by state for verification
-	reviewsByState := make(map[int]map[string]interface{})
+	// Every review produced from inline comments must be state=1 (GEI integer for COMMENTED)
 	for _, review := range reviews {
-		state := review["state"].(int)
-		reviewsByState[state] = review
+		assert.Equal(t, 1, review["state"],
+			"All inline comment groups must produce GEI state 1 (COMMENTED)")
 	}
 
-	// Verify each review state has the expected attributes
-	assert.Contains(t, reviewsByState, 1, "Should have a review with state 1 (approved)")
-	assert.Contains(t, reviewsByState, 2, "Should have a review with state 2 (commented)")
-	assert.Contains(t, reviewsByState, 3, "Should have a review with state 3 (changes requested)")
-
-	// Verify submitted dates for each state
-	assert.Equal(t, "2023-01-01T10:00:00Z", reviewsByState[1]["submitted_at"], "Approved review should have correct date")
-	assert.Equal(t, "2023-01-02T10:00:00Z", reviewsByState[2]["submitted_at"], "Commented review should have correct date")
-	assert.Equal(t, "2023-01-03T10:00:00Z", reviewsByState[3]["submitted_at"], "Changes requested review should have correct date")
+	// Verify submitted dates are preserved correctly
+	reviewsByURL := make(map[string]map[string]interface{})
+	for _, review := range reviews {
+		reviewsByURL[review["url"].(string)] = review
+	}
+	assert.Equal(t, "2023-01-01T10:00:00Z", reviewsByURL["https://example.com/review/1"]["submitted_at"])
+	assert.Equal(t, "2023-01-02T10:00:00Z", reviewsByURL["https://example.com/review/2"]["submitted_at"])
+	assert.Equal(t, "2023-01-03T10:00:00Z", reviewsByURL["https://example.com/review/3"]["submitted_at"])
 }
 
 func TestExportWithNoData(t *testing.T) {
