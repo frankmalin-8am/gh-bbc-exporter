@@ -174,31 +174,21 @@ func (e *Exporter) Export(workspace, repoSlug string) error {
 			zap.Int("regular_comments", len(regularComments)),
 			zap.Int("review_comments", len(reviewComments)),
 			zap.Int("total_comments", len(regularComments)+len(reviewComments)))
-		// Issue comments: merge PR conversation comments + approval fallback comments.
-		// approvalIssueComments is populated later (after GetPullRequestApprovals),
-		// so we collect all issue comments into a single slice and write once below.
-		allIssueComments := regularComments
-
-		// Fetch approval reviews, synthetic review comments, and issue-comment fallbacks.
-		// The synthetic review comment is included because GEI may drop pull_request_reviews
-		// that have no linked pull_request_review_comment.  The issue comment fallback
-		// ensures the approval is visible even if the review import fails.
-		approvalReviews, approvalComments, approvalIssueComments, approvalErr := e.client.GetPullRequestApprovals(workspace, repoSlug, prs)
+		// Fetch approval reviews (COMMENTED state, body="✅ Approved").
+		// GEI imports COMMENTED reviews with a non-empty body without requiring
+		// a linked pull_request_review_comment.
+		approvalReviews, approvalErr := e.client.GetPullRequestApprovals(workspace, repoSlug, prs)
 		if approvalErr != nil {
 			e.logger.Warn("Failed to fetch PR approvals", zap.Error(approvalErr))
 		}
 
-		// Merge real inline review comments with synthetic approval comments.
-		// allReviewComments drives both the file write and thread creation.
-		allReviewComments := append(reviewComments, approvalComments...)
+		allReviewComments := reviewComments
 
 		if len(allReviewComments) > 0 {
 			if err := e.writeJSONFile("pull_request_review_comments_000001.json", allReviewComments); err != nil {
 				e.logger.Warn("Failed to write pull request review comments", zap.Error(err))
 			} else {
 				e.logger.Debug("Pull request review comments written",
-					zap.Int("inline", len(reviewComments)),
-					zap.Int("approval_synthetic", len(approvalComments)),
 					zap.Int("total", len(allReviewComments)))
 			}
 
@@ -225,18 +215,11 @@ func (e *Exporter) Export(workspace, repoSlug string) error {
 			}
 		}
 
-		// Write all issue comments: regular PR conversation comments + approval fallbacks.
-		if approvalErr == nil {
-			allIssueComments = append(allIssueComments, approvalIssueComments...)
-		}
-		if len(allIssueComments) > 0 {
-			if err := e.writeJSONFile("issue_comments_000001.json", allIssueComments); err != nil {
+		if len(regularComments) > 0 {
+			if err := e.writeJSONFile("issue_comments_000001.json", regularComments); err != nil {
 				e.logger.Warn("Failed to write issue comments", zap.Error(err))
 			} else {
-				e.logger.Debug("Issue comments written",
-					zap.Int("regular", len(regularComments)),
-					zap.Int("approval_fallbacks", len(approvalIssueComments)),
-					zap.Int("total", len(allIssueComments)))
+				e.logger.Debug("Issue comments written", zap.Int("total", len(regularComments)))
 			}
 		}
 	}
@@ -739,7 +722,7 @@ func (e *Exporter) createReviews(comments []data.PullRequestReviewComment) []map
 			"url":          reviewURL,
 			"pull_request": comment.PullRequest,
 			"user":         comment.User,
-			"body":         nil,
+			"body":         "📜 _Migrated from Bitbucket: inline code review comments._",
 			"head_sha":     comment.CommitID,
 			"formatter":    "markdown",
 			"state":        1, // GEI integer: 1=COMMENTED, 2=APPROVED, 3=CHANGES_REQUESTED

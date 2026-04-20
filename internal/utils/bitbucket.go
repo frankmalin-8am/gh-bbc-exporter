@@ -438,8 +438,8 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 			baseSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Destination.Commit.Hash)
 			headSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Source.Commit.Hash)
 
-			description := ""
-			if pr.Description != nil {
+			description := "📜 _Migrated from Bitbucket: this pull request was opened without a description._"
+			if pr.Description != nil && strings.TrimSpace(*pr.Description) != "" {
 				description = *pr.Description
 			}
 
@@ -573,6 +573,7 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 
 	prURLMap := make(map[int]string)
 	prCommitMap := make(map[int]string)
+	prAuthorMap := make(map[int]string) // prID → author UUID (stripped of braces)
 
 	for _, pr := range pullRequests {
 		parts := strings.Split(pr.URL, "/")
@@ -581,6 +582,10 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 			if err == nil {
 				prURLMap[prID] = pr.URL
 				prCommitMap[prID] = pr.Head.SHA
+				// pr.User is the GEI-format URL: "https://bitbucket.org/{uuid}"
+			// Extract the UUID from the last path segment.
+			userParts := strings.Split(pr.User, "/")
+			prAuthorMap[prID] = userParts[len(userParts)-1]
 			}
 		}
 	}
@@ -617,7 +622,17 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 			for _, comment := range response.Values {
 				createdAt := formatDateToZ(comment.CreatedOn)
 				updatedAt := formatDateToZ(comment.UpdatedOn)
-				transformedBody := c.transformCommentBody(comment.Content.Raw, workspace, repoSlug)
+
+				rawBody := strings.TrimSpace(comment.Content.Raw)
+				if rawBody == "" {
+					commentorUUID := strings.Trim(comment.User.UUID, "{}")
+					if commentorUUID == prAuthorMap[prID] {
+						rawBody = "📜 _Migrated from Bitbucket: pull request opened without a description._"
+					} else {
+						rawBody = "📜 _Migrated from Bitbucket: this comment had no content._"
+					}
+				}
+				transformedBody := c.transformCommentBody(rawBody, workspace, repoSlug)
 				prNumber := fmt.Sprintf("%d", prID)
 
 				if comment.Inline != nil && comment.Inline.Path != "" {
@@ -735,56 +750,9 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 	return regularComments, reviewComments, nil
 }
 
-// GetPRFirstChangedFile fetches the PR diffstat and returns the path of the first
-// changed file.  This is used to anchor synthetic approval review comments so that
-// GEI has at least one linked pull_request_review_comment for each APPROVED review
-// (GEI silently drops reviews that have no linked comments).
-// Returns a fallback path ("README.md") if the API call fails or the diff is empty.
-func (c *Client) GetPRFirstChangedFile(workspace, repoSlug, prNumber string) string {
-	endpoint := fmt.Sprintf("repositories/%s/%s/pullrequests/%s/diffstat",
-		workspace, repoSlug, prNumber)
 
-	var result struct {
-		Values []struct {
-			New *struct {
-				Path string `json:"path"`
-			} `json:"new"`
-			Old *struct {
-				Path string `json:"path"`
-			} `json:"old"`
-		} `json:"values"`
-	}
-
-	if err := c.makeRequest("GET", endpoint, &result); err != nil {
-		c.logger.Warn("Could not fetch PR diffstat for approval comment anchor; using README.md",
-			zap.String("pr", prNumber), zap.Error(err))
-		return "README.md"
-	}
-
-	// Prefer a newly-added file (Old == nil) so the synthetic approval review comment
-	// can use the "@@ -0,0 +1,1 @@" new-file diff_hunk format, which GEI accepts.
-	// Using a modified file (Old != nil) with the new-file hunk format causes GEI to
-	// reject the review comment silently.
-	for _, v := range result.Values {
-		if v.New != nil && v.New.Path != "" && v.Old == nil {
-			return v.New.Path
-		}
-	}
-
-	// Fallback: any file that has a new path (including modifications)
-	for _, v := range result.Values {
-		if v.New != nil && v.New.Path != "" {
-			return v.New.Path
-		}
-		if v.Old != nil && v.Old.Path != "" {
-			return v.Old.Path
-		}
-	}
-
-	return "README.md"
-}
-
-// GetPullRequestApprovals builds APPROVED review records for all PRs.
+// GetPullRequestApprovals builds review records for all PRs that have Bitbucket
+// approvals.
 //
 // The Bitbucket Cloud REST API v2 does not expose a stand-alone /participants
 // list endpoint (it returns 404).  The authoritative participants data — including
@@ -795,16 +763,11 @@ func (c *Client) GetPRFirstChangedFile(workspace, repoSlug, prNumber string) str
 // The prParticipantsCache (populated from the list response) is used as a
 // last-resort fallback when the detail fetch fails.
 //
-// For each APPROVED participant:
-//   - A pull_request_review entry with state="approved" is produced (approvalReviews).
-//   - A synthetic pull_request_review_comment is produced and linked to the review
-//     (approvalComments). GEI may silently drop reviews without linked comments.
-//   - An issue_comment fallback is produced (approvalIssueComments) so that the
-//     approval text is visible in the PR conversation even if the review import fails.
+// For each APPROVED participant a pull_request_review entry is produced with
+// state=COMMENTED and body="✅ Approved".  GEI imports COMMENTED reviews that
+// have a non-empty body without requiring a linked pull_request_review_comment.
 func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequests []data.PullRequest) (
 	reviews []map[string]interface{},
-	approvalComments []data.PullRequestReviewComment,
-	approvalIssueComments []data.IssueComment,
 	err error,
 ) {
 	c.logger.Info("Fetching pull request approvals via PR detail endpoint")
@@ -831,8 +794,6 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 				zap.String("pr", prNumber),
 				zap.Int("count", len(prDetail.Participants)))
 
-			// Get the first changed file once per PR (shared across approvers).
-			var firstFile string
 			for _, p := range prDetail.Participants {
 				c.logger.Debug("Participant",
 					zap.String("pr", prNumber),
@@ -842,16 +803,8 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 				if !p.Approved {
 					continue
 				}
-				if firstFile == "" {
-					firstFile = c.GetPRFirstChangedFile(workspace, repoSlug, prNumber)
-				}
 				review := c.buildApprovalReview(workspace, repoSlug, prNumber, pr, p)
 				reviews = append(reviews, review)
-				approvalComments = append(approvalComments,
-					c.buildApprovalReviewComment(workspace, repoSlug, prNumber, pr, p,
-						review["url"].(string), firstFile))
-				approvalIssueComments = append(approvalIssueComments,
-					c.buildApprovalIssueComment(workspace, repoSlug, prNumber, pr, p))
 			}
 			continue
 		}
@@ -867,29 +820,17 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 		c.logger.Debug("Using cached embedded participants as fallback",
 			zap.String("pr", prNumber),
 			zap.Int("count", len(cached)))
-		var firstFile string
 		for _, p := range cached {
 			if !p.Approved {
 				continue
 			}
-			if firstFile == "" {
-				firstFile = c.GetPRFirstChangedFile(workspace, repoSlug, prNumber)
-			}
 			review := c.buildApprovalReview(workspace, repoSlug, prNumber, pr, p)
 			reviews = append(reviews, review)
-			approvalComments = append(approvalComments,
-				c.buildApprovalReviewComment(workspace, repoSlug, prNumber, pr, p,
-					review["url"].(string), firstFile))
-			approvalIssueComments = append(approvalIssueComments,
-				c.buildApprovalIssueComment(workspace, repoSlug, prNumber, pr, p))
 		}
 	}
 
-	c.logger.Info("Pull request approvals fetched",
-		zap.Int("reviews", len(reviews)),
-		zap.Int("synthetic_comments", len(approvalComments)),
-		zap.Int("issue_comment_fallbacks", len(approvalIssueComments)))
-	return reviews, approvalComments, approvalIssueComments, nil
+	c.logger.Info("Pull request approvals fetched", zap.Int("reviews", len(reviews)))
+	return reviews, nil
 }
 
 // approvalHashID derives a stable decimal numeric ID from a seed string using
@@ -935,7 +876,7 @@ func (c *Client) buildApprovalReview(workspace, repoSlug, prNumber string,
 		"url":          reviewURL,
 		"pull_request": prURL,
 		"user":         userURL,
-		"body":         "✅ Approved",
+		"body":         "📜 _Migrated from Bitbucket: this PR was approved before migration to GitHub._",
 		"head_sha":     pr.Head.SHA,
 		"formatter":    "markdown",
 		// GEI integer state for pull_request_review.
@@ -949,57 +890,10 @@ func (c *Client) buildApprovalReview(workspace, repoSlug, prNumber string,
 	}
 }
 
-// buildApprovalIssueComment produces a plain PR issue comment recording the
-// approval.  This acts as a fallback so that even if the pull_request_review
-// entry is not imported by GEI the approval is visible in the PR conversation.
-func (c *Client) buildApprovalIssueComment(workspace, repoSlug, prNumber string,
-	pr data.PullRequest, p data.BitbucketParticipant) data.IssueComment {
 
-	userURL := formatURL("user", workspace, "", strings.Trim(p.User.UUID, "{}"))
-	prURL := formatURL("pr", workspace, repoSlug, prNumber)
-	uuid := strings.Trim(p.User.UUID, "{}")
-
-	issueCommentNumID := approvalHashID(fmt.Sprintf("approval-issue-comment-%s-%s-%s-%s", workspace, repoSlug, prNumber, uuid))
-	commentURL := formatURL("issue_comment", workspace, repoSlug, prNumber, fmt.Sprintf("%d", issueCommentNumID))
-
-	participatedAt := p.ParticipatedOn
-	if participatedAt == "" {
-		if pr.MergedAt != nil && *pr.MergedAt != "" {
-			participatedAt = *pr.MergedAt
-		} else {
-			participatedAt = pr.CreatedAt
-		}
-	} else {
-		participatedAt = formatDateToZ(participatedAt)
-	}
-
-	return data.IssueComment{
-		Type:        "issue_comment",
-		URL:         commentURL,
-		User:        userURL,
-		Body:        "✅ Approved",
-		CreatedAt:   participatedAt,
-		Formatter:   "markdown",
-		Reactions:   []string{},
-		PullRequest: prURL,
-	}
-}
-
-// getFileDiffAnchor computes the position of the first hunk of filePath in the
-// combined unified diff between baseSHA and headSHA, and returns the real diff
-// hunk text for that anchor point.
-//
-// GitHub/GEI review-comment positions are 1-based global counters across the
-// entire combined diff: every @@ hunk-header line and every content line
-// (+/-/space) increments the counter; diff --git, index, ---, +++ header lines
-// do NOT increment it.
-//
-// Using a real position + real diff_hunk prevents GEI from silently discarding
-// the synthetic review comment (which would in turn cause the APPROVED review
-// to be dropped).
-//
-// Falls back to position=1 / "@@ -0,0 +1,1 @@\n+Approved" when the local git
-// repo is not present or the diff cannot be parsed.
+// getFileDiffAnchor is retained for potential future use but is no longer called
+// by the approval flow (COMMENTED reviews with a non-empty body import without
+// a linked comment).
 func (c *Client) getFileDiffAnchor(workspace, repoSlug, baseSHA, headSHA, filePath string) (position int, diffHunk string) {
 	// Sensible fallback in case anything goes wrong.
 	position = 1
@@ -1106,73 +1000,6 @@ func (c *Client) getFileDiffAnchor(workspace, repoSlug, baseSHA, headSHA, filePa
 	return
 }
 
-// buildApprovalReviewComment creates a synthetic pull_request_review_comment
-// linked to an approval review.  GEI requires at least one linked review comment
-// to import a pull_request_review, so we manufacture a minimal one anchored at the
-// first changed line of the first changed file in the PR diff.
-//
-// We compute the real unified-diff position (global counter across the entire
-// combined diff) and use the real hunk header text so that GEI's importer sees a
-// plausible, internally-consistent review comment rather than a synthetic
-// "@@ -0,0 +1,1 @@" fragment that doesn't match any actual diff content.
-func (c *Client) buildApprovalReviewComment(workspace, repoSlug, prNumber string,
-	pr data.PullRequest, p data.BitbucketParticipant,
-	reviewURL, filePath string) data.PullRequestReviewComment {
-
-	userURL := formatURL("user", workspace, "", strings.Trim(p.User.UUID, "{}"))
-	prURL := formatURL("pr", workspace, repoSlug, prNumber)
-
-	uuid := strings.Trim(p.User.UUID, "{}")
-
-	// Use the SAME numeric ID as the parent review.  Real Bitbucket inline comments
-	// follow the pattern: review URL ends in "#pullrequestreview-review-X" and the
-	// corresponding comment URL ends in "#rX".  GEI appears to enforce this invariant
-	// and silently drops review+comment pairs where the IDs don't match.
-	reviewNumID := approvalHashID(fmt.Sprintf("approval-review-%s-%s-%s-%s", workspace, repoSlug, prNumber, uuid))
-	threadHashID := HashString(fmt.Sprintf("approval-thread-%s-%s-%s-%s", workspace, repoSlug, prNumber, uuid))
-	commentURL := formatURL("pr_review_comment", workspace, repoSlug, prNumber, fmt.Sprintf("%d", reviewNumID))
-	threadURL := formatURL("pr_review_thread", workspace, repoSlug, prNumber, "thread-"+threadHashID)
-
-	participatedAt := p.ParticipatedOn
-	if participatedAt == "" {
-		if pr.MergedAt != nil && *pr.MergedAt != "" {
-			participatedAt = *pr.MergedAt
-		} else {
-			participatedAt = pr.CreatedAt
-		}
-	} else {
-		participatedAt = formatDateToZ(participatedAt)
-	}
-
-	// Use the same fake diff_hunk format that GetPullRequestComments uses for real
-	// inline review comments.  GEI accepts "@@ -0,0 +1,1 @@\n+Approved" with
-	// position=1 — it rejects real git diff hunks (e.g. "@@ -13,7 +13,7 @@...").
-	const pos = 1
-	const hunk = "@@ -0,0 +1,1 @@\n+✅ Approved"
-
-	return data.PullRequestReviewComment{
-		Type:                    "pull_request_review_comment",
-		URL:                     commentURL,
-		PullRequest:             prURL,
-		PullRequestReview:       reviewURL,
-		PullRequestReviewThread: threadURL,
-		Formatter:               "markdown",
-		DiffHunk:                hunk,
-		OriginalPosition:        pos,
-		OriginalCommitId:        pr.Head.SHA,
-		State:                   1, // active
-		InReplyTo:               nil,
-		Reactions:               []string{},
-		SubjectType:             "line",
-		User:                    userURL,
-		CommitID:                pr.Head.SHA,
-		Path:                    filePath,
-		Position:                pos,
-		Body:                    "✅ Approved",
-		CreatedAt:               participatedAt,
-		UpdatedAt:               participatedAt,
-	}
-}
 
 func (c *Client) transformCommentBody(body, workspace, repoSlug string) string {
 	if body == "" {
