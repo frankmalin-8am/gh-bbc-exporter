@@ -37,6 +37,15 @@ type Client struct {
 	exportDir           string
 	skipCommitLookup    bool
 	shaFallback         string // "none" | "related" | "nearest"
+	// activeUserUUIDs is the set of UUIDs (braces stripped) that are current
+	// workspace members.  Populated by GetUsers so that GetPullRequests and
+	// GetPullRequestComments can choose the right URL format per user.
+	activeUserUUIDs map[string]bool
+	// inactiveUsers collects users referenced in PRs/comments whose UUID is not
+	// in activeUserUUIDs.  They are emitted with a nickname-based URL so that
+	// the resulting mannequin in GitHub has a human-readable name.  Keyed by
+	// clean UUID (no braces).
+	inactiveUsers map[string]data.User
 }
 
 func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, logger *zap.Logger, exportDir string, skipCommitLookup bool, shaFallback string) *Client {
@@ -79,6 +88,8 @@ func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, 
 		exportDir:           exportDir,
 		skipCommitLookup:    skipCommitLookup,
 		shaFallback:         shaFallback,
+		activeUserUUIDs:     make(map[string]bool),
+		inactiveUsers:       make(map[string]data.User),
 	}
 }
 
@@ -320,10 +331,86 @@ func (c *Client) GetUsers(workspace, repoSlug string) ([]data.User, error) {
 			zap.String("url", wsURL))
 	}
 
+	// Cache active UUIDs so GetPullRequests / GetPullRequestComments can
+	// distinguish current members from former members.
+	if c.activeUserUUIDs == nil {
+		c.activeUserUUIDs = make(map[string]bool)
+	}
+	for _, u := range allUsers {
+		if u.Login != "" && u.Login != workspace {
+			c.activeUserUUIDs[u.Login] = true
+		}
+	}
+
 	c.logger.Debug("Fetched workspace members",
 		zap.Int("count", len(allUsers)))
 
 	return allUsers, nil
+}
+
+// resolveUserURL returns the canonical URL for a Bitbucket user in the GEI
+// archive format.  For users who are still active workspace members the URL
+// is UUID-based (https://bitbucket.org/<uuid>), which lets the mannequin be
+// reclaimed by the real GitHub user later.  For users who have left the
+// workspace the URL is nickname-based (https://bitbucket.org/<nickname>),
+// which produces a human-readable mannequin name instead of an opaque UUID.
+// Inactive users are registered in c.inactiveUsers so the exporter can append
+// them to users_000001.json.
+func (c *Client) resolveUserURL(workspace, uuid, nickname, displayName string) string {
+	// Lazy-initialize maps so tests that build Client literals directly still work.
+	if c.activeUserUUIDs == nil {
+		c.activeUserUUIDs = make(map[string]bool)
+	}
+	if c.inactiveUsers == nil {
+		c.inactiveUsers = make(map[string]data.User)
+	}
+
+	cleanUUID := strings.Trim(uuid, "{}")
+
+	if c.activeUserUUIDs[cleanUUID] {
+		// Active member — keep UUID-based URL for mannequin reclaim support.
+		return fmt.Sprintf("https://bitbucket.org/%s", cleanUUID)
+	}
+
+	// Inactive / unknown user — fall back to nickname for readability.
+	login := nickname
+	if login == "" {
+		login = cleanUUID // last resort: still unique, just not human-readable
+	}
+	userURL := fmt.Sprintf("https://bitbucket.org/%s", login)
+
+	// Register so the exporter can add this user to users_000001.json.
+	if _, known := c.inactiveUsers[cleanUUID]; !known {
+		name := displayName
+		if name == "" {
+			name = login
+		}
+		c.inactiveUsers[cleanUUID] = data.User{
+			Type:      "user",
+			URL:       userURL,
+			Login:     login,
+			Name:      name,
+			Emails:    []data.Email{},
+			CreatedAt: formatDateToZ(time.Now().Format(time.RFC3339)),
+		}
+		c.logger.Debug("Discovered inactive user — using nickname-based URL",
+			zap.String("uuid", cleanUUID),
+			zap.String("nickname", login),
+			zap.String("url", userURL))
+	}
+
+	return userURL
+}
+
+// GetInactiveUsers returns all users discovered during PR/comment processing
+// whose UUID was not found in the active workspace member list.  The exporter
+// should merge these into users_000001.json after all PR data is fetched.
+func (c *Client) GetInactiveUsers() []data.User {
+	users := make([]data.User, 0, len(c.inactiveUsers))
+	for _, u := range c.inactiveUsers {
+		users = append(users, u)
+	}
+	return users
 }
 
 func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, prsFromDate string) ([]data.PullRequest, error) {
@@ -458,7 +545,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 			}
 
 			prURL := formatURL("pr", workspace, repoSlug, pr.ID)
-			userURL := formatURL("user", workspace, "", strings.Trim(pr.Author.UUID, "{}"))
+			userURL := c.resolveUserURL(workspace, pr.Author.UUID, pr.Author.Nickname, pr.Author.DisplayName)
 			repoURL := formatURL("repository", workspace, repoSlug)
 			prUser := formatURL("user", workspace, "")
 
@@ -810,7 +897,7 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 					reviewURL := formatURL("pr_review", workspace, repoSlug, prNumber, reviewId)
 					threadURL := formatURL("pr_review_thread", workspace, repoSlug, prNumber, threadId)
 					prFullURL := formatURL("pr", workspace, repoSlug, prNumber)
-					userURL := formatURL("user", workspace, "", strings.Trim(comment.User.UUID, "{}"))
+					userURL := c.resolveUserURL(workspace, comment.User.UUID, comment.User.Nickname, comment.User.DisplayName)
 					commitSHA := prCommitMap[prID]
 
 					// Create diff hunk
@@ -844,7 +931,7 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 				} else {
 					commentURL := formatURL("issue_comment", workspace, repoSlug, prNumber, comment.ID)
 					prURL := formatURL("pr", workspace, repoSlug, prNumber)
-					userURL := formatURL("user", workspace, "", strings.Trim(comment.User.UUID, "{}"))
+					userURL := c.resolveUserURL(workspace, comment.User.UUID, comment.User.Nickname, comment.User.DisplayName)
 
 					regularComment := data.IssueComment{
 						Type:        "issue_comment",
@@ -985,7 +1072,7 @@ func approvalHashID(seed string) uint32 {
 func (c *Client) buildApprovalReview(workspace, repoSlug, prNumber string,
 	pr data.PullRequest, p data.BitbucketParticipant) map[string]interface{} {
 
-	userURL := formatURL("user", workspace, "", strings.Trim(p.User.UUID, "{}"))
+	userURL := c.resolveUserURL(workspace, p.User.UUID, p.User.Nickname, p.User.DisplayName)
 	prURL := formatURL("pr", workspace, repoSlug, prNumber)
 	uuid := strings.Trim(p.User.UUID, "{}")
 
