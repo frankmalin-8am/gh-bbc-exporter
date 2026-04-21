@@ -292,6 +292,32 @@ func (c *Client) GetUsers(workspace, repoSlug string) ([]data.User, error) {
 		})
 	}
 
+	// Always ensure the workspace system user is present so that migration
+	// summary comments (attributed to this URL) resolve to a valid mannequin.
+	wsURL := fmt.Sprintf("https://bitbucket.org/%s", workspace)
+	found := false
+	for _, u := range allUsers {
+		if u.URL == wsURL {
+			found = true
+			break
+		}
+	}
+	if !found {
+		allUsers = append(allUsers, data.User{
+			Type:      "user",
+			URL:       wsURL,
+			Login:     workspace,
+			Name:      workspace,
+			Company:   nil,
+			Website:   nil,
+			Location:  nil,
+			Emails:    []data.Email{},
+			CreatedAt: formatDateToZ(time.Now().Format(time.RFC3339)),
+		})
+		c.logger.Debug("Added workspace system user for migration attribution",
+			zap.String("url", wsURL))
+	}
+
 	c.logger.Debug("Fetched workspace members",
 		zap.Int("count", len(allUsers)))
 
@@ -751,23 +777,15 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 }
 
 
-// GetPullRequestApprovals builds review records for all PRs that have Bitbucket
-// approvals.
+// GetPullRequestApprovals fetches approval reviews and builds a migration
+// summary comment for each PR.  Both are returned to the caller so they can be
+// written to the appropriate archive files.
 //
-// The Bitbucket Cloud REST API v2 does not expose a stand-alone /participants
-// list endpoint (it returns 404).  The authoritative participants data — including
-// approval status — is available in the individual PR detail response
-// (GET /repositories/{ws}/{repo}/pullrequests/{id}).  The PR LIST endpoint omits
-// this field, so we must fetch each PR individually here.
-//
-// The prParticipantsCache (populated from the list response) is used as a
-// last-resort fallback when the detail fetch fails.
-//
-// For each APPROVED participant a pull_request_review entry is produced with
-// state=COMMENTED and body="✅ Approved".  GEI imports COMMENTED reviews that
-// have a non-empty body without requiring a linked pull_request_review_comment.
+// reviews        → pull_request_reviews_000001.json  (COMMENTED state)
+// summaryComments → issue_comments_000001.json        (migration summary)
 func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequests []data.PullRequest) (
 	reviews []map[string]interface{},
+	summaryComments []data.IssueComment,
 	err error,
 ) {
 	c.logger.Info("Fetching pull request approvals via PR detail endpoint")
@@ -806,6 +824,13 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 				review := c.buildApprovalReview(workspace, repoSlug, prNumber, pr, p)
 				reviews = append(reviews, review)
 			}
+
+			// Build the migration summary comment using the full PR detail.
+			summary := c.buildMigrationSummaryComment(
+				workspace, repoSlug, prNumber,
+				pr, prDetail.Author.DisplayName, prDetail.Participants,
+			)
+			summaryComments = append(summaryComments, summary)
 			continue
 		}
 
@@ -815,22 +840,34 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 		if !hasCached {
 			c.logger.Debug("No participants available for PR (detail fetch failed, no cache)",
 				zap.String("pr", prNumber))
-			continue
-		}
-		c.logger.Debug("Using cached embedded participants as fallback",
-			zap.String("pr", prNumber),
-			zap.Int("count", len(cached)))
-		for _, p := range cached {
-			if !p.Approved {
-				continue
+		} else {
+			c.logger.Debug("Using cached embedded participants as fallback",
+				zap.String("pr", prNumber),
+				zap.Int("count", len(cached)))
+			for _, p := range cached {
+				if !p.Approved {
+					continue
+				}
+				review := c.buildApprovalReview(workspace, repoSlug, prNumber, pr, p)
+				reviews = append(reviews, review)
 			}
-			review := c.buildApprovalReview(workspace, repoSlug, prNumber, pr, p)
-			reviews = append(reviews, review)
 		}
+
+		// For the summary comment in the fallback path, use the UUID extracted
+		// from pr.User as the author display name (best effort).
+		authorParts := strings.Split(pr.User, "/")
+		authorName := authorParts[len(authorParts)-1]
+		summary := c.buildMigrationSummaryComment(
+			workspace, repoSlug, prNumber,
+			pr, authorName, cached,
+		)
+		summaryComments = append(summaryComments, summary)
 	}
 
-	c.logger.Info("Pull request approvals fetched", zap.Int("reviews", len(reviews)))
-	return reviews, nil
+	c.logger.Info("Pull request approvals fetched",
+		zap.Int("reviews", len(reviews)),
+		zap.Int("summary_comments", len(summaryComments)))
+	return reviews, summaryComments, nil
 }
 
 // approvalHashID derives a stable decimal numeric ID from a seed string using
@@ -890,6 +927,124 @@ func (c *Client) buildApprovalReview(workspace, repoSlug, prNumber string,
 	}
 }
 
+
+// formatDateOnly returns just the YYYY-MM-DD portion of any timestamp that
+// formatDateToZ can parse, making it safe to use with Bitbucket or GEI dates.
+func formatDateOnly(ts string) string {
+	normalised := formatDateToZ(ts)
+	if len(normalised) >= 10 {
+		return normalised[:10]
+	}
+	if len(ts) >= 10 {
+		return ts[:10] // best-effort fallback
+	}
+	return ts
+}
+
+// buildMigrationSummaryComment produces an issue_comment that summarises a
+// migrated pull request: who opened it, who approved or requested changes, and
+// when it was closed or merged.
+//
+// The comment is attributed to the workspace user URL so it appears under a
+// clearly identifiable migration mannequin rather than any real participant.
+// Once GEI has created the mannequin it can be reclaimed or left as-is.
+func (c *Client) buildMigrationSummaryComment(
+	workspace, repoSlug, prNumber string,
+	pr data.PullRequest,
+	authorDisplayName string,
+	participants []data.BitbucketParticipant,
+) data.IssueComment {
+
+	openDate := formatDateOnly(pr.CreatedAt)
+
+	// Collect approval and needs-work participants, skipping the PR author.
+	var approvers []string
+	var changesRequested []string
+	for _, p := range participants {
+		if p.Role == "AUTHOR" {
+			continue
+		}
+		name := p.User.DisplayName
+		if name == "" {
+			name = strings.Trim(p.User.UUID, "{}")
+		}
+		if p.Approved {
+			date := formatDateOnly(p.ParticipatedOn)
+			if date != "" {
+				approvers = append(approvers, fmt.Sprintf("%s (%s)", name, date))
+			} else {
+				approvers = append(approvers, name)
+			}
+		} else if p.State == "changes_requested" || p.State == "needs_work" {
+			changesRequested = append(changesRequested, name)
+		}
+	}
+
+	// Build the comment body.  Two trailing spaces force a GitHub line-break.
+	var lines []string
+	lines = append(lines, "📜 **Bitbucket Pull Request Migration Summary**\n")
+
+	author := authorDisplayName
+	if author == "" {
+		// Extract UUID from URL as a last resort
+		parts := strings.Split(pr.User, "/")
+		author = parts[len(parts)-1]
+	}
+	lines = append(lines, fmt.Sprintf("**Opened:** %s by %s", openDate, author))
+
+	if len(approvers) > 0 {
+		lines = append(lines, fmt.Sprintf("**Approved by:** %s", strings.Join(approvers, ", ")))
+	} else {
+		lines = append(lines, "**Approved by:** _(none)_")
+	}
+	if len(changesRequested) > 0 {
+		lines = append(lines, fmt.Sprintf("**Changes requested by:** %s", strings.Join(changesRequested, ", ")))
+	}
+
+	if pr.MergedAt != nil && *pr.MergedAt != "" {
+		lines = append(lines, fmt.Sprintf("**Merged:** %s", formatDateOnly(*pr.MergedAt)))
+	} else if pr.ClosedAt != nil && *pr.ClosedAt != "" {
+		lines = append(lines, fmt.Sprintf("**Closed:** %s", formatDateOnly(*pr.ClosedAt)))
+	} else {
+		lines = append(lines, "**Status:** Open at time of migration")
+	}
+
+	body := strings.Join(lines, "  \n")
+
+	// Pin the comment 1 second after close/merge so it appears at the bottom
+	// of the PR timeline.
+	commentTime := pr.CreatedAt
+	if pr.MergedAt != nil && *pr.MergedAt != "" {
+		commentTime = *pr.MergedAt
+	} else if pr.ClosedAt != nil && *pr.ClosedAt != "" {
+		commentTime = *pr.ClosedAt
+	}
+	if t, parseErr := time.Parse(time.RFC3339, commentTime); parseErr == nil {
+		commentTime = formatDateToZ(t.Add(time.Second).Format(time.RFC3339))
+	}
+
+	// Stable unique ID for the comment URL so re-runs don't produce duplicates.
+	seed := fmt.Sprintf("summary-%s-%s-%s", workspace, repoSlug, prNumber)
+	commentID := approvalHashID(seed)
+
+	prURL := formatURL("pr", workspace, repoSlug, prNumber)
+	commentURL := formatURL("issue_comment", workspace, repoSlug, prNumber, commentID)
+
+	// Attribute to the workspace system user — this becomes a mannequin
+	// clearly named after the workspace, marking it as a migration artefact.
+	userURL := fmt.Sprintf("https://bitbucket.org/%s", workspace)
+
+	return data.IssueComment{
+		Type:        "issue_comment",
+		URL:         commentURL,
+		User:        userURL,
+		Body:        body,
+		CreatedAt:   commentTime,
+		Formatter:   "markdown",
+		Reactions:   []string{},
+		PullRequest: prURL,
+	}
+}
 
 // getFileDiffAnchor is retained for potential future use but is no longer called
 // by the approval flow (COMMENTED reviews with a non-empty body import without

@@ -166,8 +166,12 @@ func TestGetUsers(t *testing.T) {
 	users, err = client.GetUsers("workspace", "repo")
 
 	assert.NoError(t, err)
-	assert.Len(t, users, 1)
+	// Expect 2 users: the real API user + the workspace system user always injected
+	// for migration summary attribution.
+	assert.Len(t, users, 2)
 	assert.Equal(t, "Test User", users[0].Name)
+	// Workspace system user should always be present.
+	assert.Equal(t, "https://bitbucket.org/workspace", users[1].URL)
 
 	// Test case 3: API returns an error
 	testServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
