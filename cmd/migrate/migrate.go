@@ -20,7 +20,24 @@ func NewCmdMigrate() *cobra.Command {
 	migrateCmd := &cobra.Command{
 		Use:   "migrate [flags]",
 		Short: "Export from Bitbucket and import to GitHub",
-		Long:  "Migrate a repository from Bitbucket Cloud to GitHub Enterprise.",
+		Long: `Migrate a repository from Bitbucket Cloud to GitHub Enterprise.
+
+Combines the export and import steps into a single command.  Pull requests
+whose commit SHAs can no longer be resolved (e.g. objects GC'd after branch
+deletion) would otherwise be silently dropped by the GitHub Enterprise
+Importer (GEI).  The --sha-fallback flag controls how these are handled:
+
+  none     Pass the unresolvable SHA through as-is.  GEI will silently drop
+           any PR it cannot anchor to a commit.
+
+  related  (default) Try the merge-commit SHA first (MERGED PRs only), then
+           fall back to the base-branch SHA.  Both must be full 40-character
+           SHAs; short/unresolvable values are not used as substitutes.
+
+  nearest  All of 'related', plus a final fallback: find the most recent
+           commit on the destination branch that predates the PR's open date
+           using the locally cloned repository.  Historically approximate but
+           always produces a valid SHA that GEI will accept.`,
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			if exportFlags.Workspace == "" {
 				return fmt.Errorf("bitbucket workspace must be specified")
@@ -147,6 +164,8 @@ func NewCmdMigrate() *cobra.Command {
 		"Export pull requests created on or after this date (format: YYYY-MM-DD)")
 	migrateCmd.PersistentFlags().BoolVar(&exportFlags.SkipCommitLookup, "skip-commit-lookup", false,
 		"Skip Bitbucket API lookups to retrieve commit SHAs (use local lookup only)")
+	migrateCmd.PersistentFlags().StringVar(&exportFlags.SHAFallback, "sha-fallback", "related",
+		"How to handle PRs with unresolvable commit SHAs: none (pass through, GEI will drop), related (use merge/base SHA), nearest (related + nearest local commit by date)")
 
 	migrateCmd.PersistentFlags().StringVar(&migrateFlags.TargetOrg, "target-org", "",
 		"Target GitHub organization (required)")
@@ -221,6 +240,7 @@ func runCmdMigrate(exportFlags *data.CmdExportFlags, migrateFlags *data.CmdMigra
 		logger,
 		exportFlags.OutputDir,
 		exportFlags.SkipCommitLookup,
+		exportFlags.SHAFallback,
 	)
 	logger.Debug("Bitbucket client created")
 
