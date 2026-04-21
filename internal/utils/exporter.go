@@ -231,6 +231,10 @@ func (e *Exporter) Export(workspace, repoSlug string) error {
 		}
 	}
 
+	// Merge inactive users (former workspace members referenced in PRs/comments/reviews)
+	// into users_000001.json so they resolve to readable nickname-based mannequins.
+	e.mergeInactiveUsers()
+
 	// Ensure every user URL referenced in PR/comment/review data has an entry in
 	// users_000001.json.  This catches both workspace-member API failures and external
 	// collaborators (reviewers who are not workspace members).
@@ -742,6 +746,64 @@ func (e *Exporter) createReviews(comments []data.PullRequestReviewComment) []map
 	}
 
 	return reviews
+}
+
+// mergeInactiveUsers writes former workspace members discovered during PR/comment/review
+// processing into users_000001.json.  These users have nickname-based URLs (not UUID URLs)
+// so backfillMissingUsers's UUID regex would not pick them up.  Doing this before
+// backfillMissingUsers also means that the UUID-backfill step won't create a second,
+// duplicate entry for the same person.
+func (e *Exporter) mergeInactiveUsers() {
+	inactiveUsers := e.client.GetInactiveUsers()
+	if len(inactiveUsers) == 0 {
+		return
+	}
+
+	usersPath := filepath.Join(e.outputDir, "users_000001.json")
+
+	var users []data.User
+	if raw, err := os.ReadFile(usersPath); err == nil {
+		if err := json.Unmarshal(raw, &users); err != nil {
+			e.logger.Warn("mergeInactiveUsers: failed to parse users file", zap.Error(err))
+			return
+		}
+	}
+
+	known := make(map[string]bool, len(users))
+	for _, u := range users {
+		known[u.URL] = true
+	}
+
+	added := 0
+	for _, u := range inactiveUsers {
+		if known[u.URL] {
+			continue
+		}
+		users = append(users, u)
+		known[u.URL] = true
+		added++
+		e.logger.Debug("mergeInactiveUsers: adding inactive user",
+			zap.String("login", u.Login),
+			zap.String("url", u.URL))
+	}
+
+	if added == 0 {
+		return
+	}
+
+	updated, err := json.Marshal(users)
+	if err != nil {
+		e.logger.Warn("mergeInactiveUsers: failed to marshal users", zap.Error(err))
+		return
+	}
+	if err := os.WriteFile(usersPath, updated, 0600); err != nil {
+		e.logger.Warn("mergeInactiveUsers: failed to write users file", zap.Error(err))
+		return
+	}
+
+	e.logger.Info("mergeInactiveUsers: inactive users added to users file",
+		zap.Int("added", added),
+		zap.Int("total_users", len(users)))
 }
 
 // backfillMissingUsers scans every JSON file in the export directory for "user" fields
