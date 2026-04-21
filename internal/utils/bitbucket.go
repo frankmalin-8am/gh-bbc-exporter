@@ -36,9 +36,10 @@ type Client struct {
 	prParticipantsCache map[string][]data.BitbucketParticipant
 	exportDir           string
 	skipCommitLookup    bool
+	shaFallback         string // "none" | "related" | "nearest"
 }
 
-func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, logger *zap.Logger, exportDir string, skipCommitLookup bool) *Client {
+func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, logger *zap.Logger, exportDir string, skipCommitLookup bool, shaFallback string) *Client {
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	if !strings.Contains(baseURL, "/2.0") && strings.Contains(baseURL, "api.bitbucket.org") {
@@ -77,6 +78,7 @@ func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, 
 		prParticipantsCache: make(map[string][]data.BitbucketParticipant),
 		exportDir:           exportDir,
 		skipCommitLookup:    skipCommitLookup,
+		shaFallback:         shaFallback,
 	}
 }
 
@@ -464,16 +466,114 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 			baseSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Destination.Commit.Hash)
 			headSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Source.Commit.Hash)
 
-			description := "📜 _Migrated from Bitbucket: this pull request was opened without a description._"
-			if pr.Description != nil && strings.TrimSpace(*pr.Description) != "" {
-				description = *pr.Description
-			}
-
-			// Format merge commit SHA if available
+			// Format merge commit SHA if available.  This must be resolved before
+			// the headSHA fallback below so it can be used as the fallback value.
+			// If the merge commit is unresolvable (short SHA), leave the pointer nil
+			// rather than storing a dangling reference — GEI treats nil the same as
+			// an absent field, which is cleaner than an invalid short SHA.
 			var mergeCommitSHA *string
 			if pr.MergeCommit != nil && pr.State == "MERGED" {
 				fullMergeSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.MergeCommit.Hash)
-				mergeCommitSHA = &fullMergeSHA
+				if len(fullMergeSHA) == 40 {
+					mergeCommitSHA = &fullMergeSHA
+				} else {
+					c.logger.Debug("merge commit SHA unresolvable — omitting from export",
+						zap.Int("pr_id", pr.ID),
+						zap.String("short_sha", fullMergeSHA))
+				}
+			}
+
+			// Source-branch and base-branch commits are sometimes inaccessible on
+			// old PRs (branch deleted + objects GC'd).  A SHA shorter than 40
+			// chars means GetFullCommitSHA couldn't resolve it.  GEI silently
+			// drops any PR whose head or base SHA is not a valid 40-char value.
+			//
+			// Behaviour is controlled by --sha-fallback:
+			//   "none"    — no substitution; pass short SHAs through as-is
+			//   "related" — headSHA: try merge commit SHA (MERGED), then baseSHA
+			//               baseSHA: try headSHA (once resolved), then nearest
+			//   "nearest" — all of "related", then fall back to the nearest/oldest
+			//               commit on the destination branch from the local clone
+
+			// ── headSHA fallback ────────────────────────────────────────────────
+			if c.shaFallback != "none" && len(headSHA) < 40 {
+				original := headSHA
+				if mergeCommitSHA != nil && len(*mergeCommitSHA) == 40 {
+					headSHA = *mergeCommitSHA
+					c.logger.Debug("headSHA unresolvable — using merge commit SHA as fallback",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("fallback_sha", headSHA))
+				} else if len(baseSHA) == 40 {
+					headSHA = baseSHA
+					c.logger.Debug("headSHA unresolvable — using base SHA as fallback",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("fallback_sha", headSHA))
+				} else if c.shaFallback == "nearest" {
+					nearestSHA := c.getNearestCommitSHA(workspace, repoSlug,
+						pr.Destination.Branch.Name, pr.CreatedOn)
+					if nearestSHA != "" {
+						headSHA = nearestSHA
+						c.logger.Debug("headSHA unresolvable — using nearest local commit as fallback",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("destination_branch", pr.Destination.Branch.Name),
+							zap.String("fallback_sha", headSHA))
+					} else {
+						c.logger.Warn("PR has no resolvable head SHA — GEI may skip it",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("sha_fallback", c.shaFallback))
+					}
+				} else {
+					c.logger.Warn("PR has no resolvable head SHA — GEI may skip it",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("sha_fallback", c.shaFallback))
+				}
+			}
+
+			// ── baseSHA fallback ────────────────────────────────────────────────
+			// baseSHA must also be a full 40-char value.  Old destination-branch
+			// history can be GC'd just as source-branch history can be.
+			if c.shaFallback != "none" && len(baseSHA) < 40 {
+				original := baseSHA
+				if len(headSHA) == 40 {
+					// headSHA is already anchored (original or via fallback above);
+					// using it for base is imprecise but keeps the PR importable.
+					baseSHA = headSHA
+					c.logger.Debug("baseSHA unresolvable — using resolved head SHA as fallback",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("fallback_sha", baseSHA))
+				} else if c.shaFallback == "nearest" {
+					nearestSHA := c.getNearestCommitSHA(workspace, repoSlug,
+						pr.Destination.Branch.Name, pr.CreatedOn)
+					if nearestSHA != "" {
+						baseSHA = nearestSHA
+						c.logger.Debug("baseSHA unresolvable — using nearest local commit as fallback",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("destination_branch", pr.Destination.Branch.Name),
+							zap.String("fallback_sha", baseSHA))
+					} else {
+						c.logger.Warn("PR has no resolvable base SHA — GEI may skip it",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("sha_fallback", c.shaFallback))
+					}
+				} else {
+					c.logger.Warn("PR has no resolvable base SHA — GEI may skip it",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("sha_fallback", c.shaFallback))
+				}
+			}
+
+			description := "📜 _Migrated from Bitbucket: this pull request was opened without a description._"
+			if pr.Description != nil && strings.TrimSpace(*pr.Description) != "" {
+				description = *pr.Description
 			}
 
 			// Create the Pull Request with GitHub-compatible structure
@@ -1047,6 +1147,74 @@ func (c *Client) buildMigrationSummaryComment(
 }
 
 // getFileDiffAnchor is retained for potential future use but is no longer called
+// getNearestCommitSHA returns the full 40-char SHA of the most recent commit
+// on branchName that was created at or before beforeDate (RFC3339 / ISO-8601).
+// It uses the bare git repo already cloned into the export directory.
+// Returns "" if the repo is not found, the branch has no commits before that
+// date, or any git command fails.
+func (c *Client) getNearestCommitSHA(workspace, repoSlug, branchName, beforeDate string) string {
+	repoPath := filepath.Join(c.exportDir, "repositories", workspace, repoSlug+".git")
+	if _, err := os.Stat(repoPath); err != nil {
+		c.logger.Debug("getNearestCommitSHA: local git repo not found",
+			zap.String("path", repoPath))
+		return ""
+	}
+
+	// Normalise the date to a format git accepts (YYYY-MM-DD is fine).
+	dateStr := formatDateOnly(beforeDate)
+
+	// Try several ref forms — the bare clone may use heads/ or remotes/origin/.
+	refs := []string{
+		"refs/heads/" + branchName,
+		"refs/remotes/origin/" + branchName,
+		branchName,
+	}
+
+	for _, ref := range refs {
+		out, err := exec.Command(
+			"git", "--git-dir", repoPath,
+			"log", "--before="+dateStr, "--format=%H", ref,
+		).Output()
+		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+			continue
+		}
+		// First line is the most recent commit on or before the date.
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) > 0 && len(lines[0]) == 40 {
+			return lines[0]
+		}
+	}
+
+	// No commit predates the PR's open date — the clone's history doesn't reach
+	// that far back (objects GC'd on Bitbucket's side before the clone was made).
+	// Fall back to the oldest available commit on the branch: it is at least the
+	// closest surviving ancestor, and GEI will accept any valid 40-char SHA.
+	c.logger.Debug("getNearestCommitSHA: no commit found before date, trying oldest commit on branch",
+		zap.String("branch", branchName),
+		zap.String("before", dateStr))
+
+	for _, ref := range refs {
+		out, err := exec.Command(
+			"git", "--git-dir", repoPath,
+			"log", "--reverse", "--format=%H", ref,
+		).Output()
+		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+			continue
+		}
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) > 0 && len(lines[0]) == 40 {
+			c.logger.Debug("getNearestCommitSHA: using oldest available commit as fallback",
+				zap.String("branch", branchName),
+				zap.String("sha", lines[0]))
+			return lines[0]
+		}
+	}
+
+	c.logger.Debug("getNearestCommitSHA: branch has no resolvable commits",
+		zap.String("branch", branchName))
+	return ""
+}
+
 // by the approval flow (COMMENTED reviews with a non-empty body import without
 // a linked comment).
 func (c *Client) getFileDiffAnchor(workspace, repoSlug, baseSHA, headSHA, filePath string) (position int, diffHunk string) {

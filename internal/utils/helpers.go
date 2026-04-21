@@ -359,6 +359,19 @@ func ValidateExportFlags(cmdFlags *data.CmdExportFlags) error {
 		}
 	}
 
+	// Validate SHAFallback value.  Empty string is normalised to the default
+	// so that callers that build CmdExportFlags programmatically (e.g. tests)
+	// don't have to set this field explicitly.
+	if cmdFlags.SHAFallback == "" {
+		cmdFlags.SHAFallback = "related"
+	}
+	switch cmdFlags.SHAFallback {
+	case "none", "related", "nearest":
+		// valid
+	default:
+		return fmt.Errorf("invalid value %q for --sha-fallback: must be one of: none, related, nearest", cmdFlags.SHAFallback)
+	}
+
 	return nil
 }
 

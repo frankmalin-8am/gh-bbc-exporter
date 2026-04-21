@@ -13,7 +13,8 @@ type CmdExportFlags struct {
 	TempDir              string
 	PRsFromDate          string // Format: YYYY-MM-DD
 	OpenPRsOnly          bool
-	SkipCommitLookup     bool // If true, do not call Bitbucket Cloud API to retrieve commit SHAs
+	SkipCommitLookup     bool   // If true, do not call Bitbucket Cloud API to retrieve commit SHAs
+	SHAFallback          string // How to handle unresolvable commit SHAs: "none", "related", "nearest"
 	Debug                bool
 }
 

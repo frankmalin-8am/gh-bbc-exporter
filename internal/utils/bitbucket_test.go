@@ -31,7 +31,7 @@ func writeResponse(t *testing.T, w http.ResponseWriter, data []byte) {
 
 func TestNewClient(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
-	client := NewClient("https://example.com", "token", "api-token", "email", "user", "pass", logger, "/path/to/export", true)
+	client := NewClient("https://example.com", "token", "api-token", "email", "user", "pass", logger, "/path/to/export", true, "related")
 
 	assert.NotNil(t, client)
 	assert.Equal(t, "https://example.com", client.baseURL)
