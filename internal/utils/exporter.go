@@ -174,10 +174,9 @@ func (e *Exporter) Export(workspace, repoSlug string) error {
 			zap.Int("regular_comments", len(regularComments)),
 			zap.Int("review_comments", len(reviewComments)),
 			zap.Int("total_comments", len(regularComments)+len(reviewComments)))
-		// Fetch approval reviews (COMMENTED state, body="✅ Approved").
-		// GEI imports COMMENTED reviews with a non-empty body without requiring
-		// a linked pull_request_review_comment.
-		approvalReviews, approvalErr := e.client.GetPullRequestApprovals(workspace, repoSlug, prs)
+		// Fetch approval reviews (COMMENTED state) and per-PR migration summary
+		// comments in a single pass — both use the full PR detail endpoint.
+		approvalReviews, summaryComments, approvalErr := e.client.GetPullRequestApprovals(workspace, repoSlug, prs)
 		if approvalErr != nil {
 			e.logger.Warn("Failed to fetch PR approvals", zap.Error(approvalErr))
 		}
@@ -213,6 +212,14 @@ func (e *Exporter) Export(workspace, repoSlug string) error {
 			if err := e.writeJSONFile("pull_request_reviews_000001.json", reviews); err != nil {
 				e.logger.Warn("Failed to write reviews", zap.Error(err))
 			}
+		}
+
+		// Append per-PR migration summary comments so they appear at the bottom
+		// of each PR timeline, attributed to the workspace migration mannequin.
+		if approvalErr == nil && len(summaryComments) > 0 {
+			regularComments = append(regularComments, summaryComments...)
+			e.logger.Debug("Migration summary comments appended",
+				zap.Int("count", len(summaryComments)))
 		}
 
 		if len(regularComments) > 0 {
