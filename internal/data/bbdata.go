@@ -15,6 +15,7 @@ type CmdExportFlags struct {
 	OpenPRsOnly          bool
 	SkipCommitLookup     bool   // If true, do not call Bitbucket Cloud API to retrieve commit SHAs
 	SHAFallback          string // How to handle unresolvable commit SHAs: "none", "related", "nearest"
+	AllowAmbiguousRefs   bool   // If true, warn instead of failing when a branch and tag share the same name
 	Debug                bool
 }
 

@@ -166,6 +166,8 @@ Importer (GEI).  The --sha-fallback flag controls how these are handled:
 		"Skip Bitbucket API lookups to retrieve commit SHAs (use local lookup only)")
 	migrateCmd.PersistentFlags().StringVar(&exportFlags.SHAFallback, "sha-fallback", "related",
 		"How to handle PRs with unresolvable commit SHAs: none (pass through, GEI will drop), related (use merge/base SHA), nearest (related + nearest local commit by date)")
+	migrateCmd.PersistentFlags().BoolVar(&exportFlags.AllowAmbiguousRefs, "allow-ambiguous-refs", false,
+		"Warn instead of failing when a branch and tag share the same name (checkout behaviour will favour the branch)")
 
 	migrateCmd.PersistentFlags().StringVar(&migrateFlags.TargetOrg, "target-org", "",
 		"Target GitHub organization (required)")
@@ -250,6 +252,10 @@ func runCmdMigrate(exportFlags *data.CmdExportFlags, migrateFlags *data.CmdMigra
 		zap.String("prsFromDate", exportFlags.PRsFromDate))
 
 	exporter := utils.NewExporter(client, exportFlags.OutputDir, logger, exportFlags.OpenPRsOnly, exportFlags.PRsFromDate)
+	if exportFlags.AllowAmbiguousRefs {
+		exporter.SetAllowAmbiguousRefs(true)
+		logger.Info("Ambiguous ref check: branch/tag name collisions will be warned, not failed (--allow-ambiguous-refs)")
+	}
 
 	logger.Debug("Starting export",
 		zap.String("workspace", exportFlags.Workspace),

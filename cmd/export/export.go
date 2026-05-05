@@ -91,6 +91,8 @@ handled:
 		"Skip Bitbucket API lookups to retrieve commit SHAs (use local lookup only)")
 	exportCmd.PersistentFlags().StringVar(&cmdExportFlags.SHAFallback, "sha-fallback", "related",
 		"How to handle PRs with unresolvable commit SHAs: none (pass through, GEI will drop), related (use merge/base SHA), nearest (related + nearest local commit by date)")
+	exportCmd.PersistentFlags().BoolVar(&cmdExportFlags.AllowAmbiguousRefs, "allow-ambiguous-refs", false,
+		"Warn instead of failing when a branch and tag share the same name (checkout behaviour will favour the branch)")
 	exportCmd.PersistentFlags().BoolVarP(&cmdExportFlags.Debug, "debug", "d", false, "Enable debug logging")
 
 	if err := exportCmd.MarkPersistentFlagRequired("workspace"); err != nil {
@@ -151,6 +153,10 @@ func runCmdExport(cmdExportFlags *data.CmdExportFlags, logger *zap.Logger) error
 	logger.Info("SHA fallback mode", zap.String("sha_fallback", cmdExportFlags.SHAFallback))
 
 	exporter := utils.NewExporter(client, cmdExportFlags.OutputDir, logger, cmdExportFlags.OpenPRsOnly, cmdExportFlags.PRsFromDate)
+	if cmdExportFlags.AllowAmbiguousRefs {
+		exporter.SetAllowAmbiguousRefs(true)
+		logger.Info("Ambiguous ref check: branch/tag name collisions will be warned, not failed (--allow-ambiguous-refs)")
+	}
 
 	if cmdExportFlags.TempDir != "" {
 		exporter.SetTempDir(cmdExportFlags.TempDir)

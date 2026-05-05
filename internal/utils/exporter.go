@@ -20,12 +20,13 @@ import (
 )
 
 type Exporter struct {
-	client      *Client
-	outputDir   string
-	logger      *zap.Logger
-	openPRsOnly bool
-	prsFromDate string
-	tempDir     string
+	client             *Client
+	outputDir          string
+	logger             *zap.Logger
+	openPRsOnly        bool
+	prsFromDate        string
+	tempDir            string
+	allowAmbiguousRefs bool
 }
 
 func NewExporter(client *Client, outputDir string, logger *zap.Logger, openPRsOnly bool, prsFromDate string) *Exporter {
@@ -36,6 +37,10 @@ func NewExporter(client *Client, outputDir string, logger *zap.Logger, openPRsOn
 		openPRsOnly: openPRsOnly,
 		prsFromDate: prsFromDate,
 	}
+}
+
+func (e *Exporter) SetAllowAmbiguousRefs(allow bool) {
+	e.allowAmbiguousRefs = allow
 }
 
 func (e *Exporter) SetTempDir(tempDir string) {
