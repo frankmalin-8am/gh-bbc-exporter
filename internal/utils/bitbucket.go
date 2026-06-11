@@ -221,11 +221,19 @@ func (c *Client) makeRequest(method, endpoint string, v interface{}) error {
 			return json.NewDecoder(resp.Body).Decode(v)
 		}
 
-		// Handle other errors
+		// Handle other errors.  404s are logged at DEBUG because callers
+		// frequently expect them (GC'd commits, deleted branches) and handle
+		// them gracefully with fallback logic.  All other non-2xx statuses
+		// are genuine errors and warrant ERROR level.
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		err = fmt.Errorf("API request failed with status %d: %s: %s",
 			resp.StatusCode, resp.Status, string(bodyBytes))
-		c.logger.Error("API request failed", zap.Error(err))
+		if resp.StatusCode == 404 {
+			c.logger.Debug("API request returned 404 (caller will handle)",
+				zap.String("url", fullURL))
+		} else {
+			c.logger.Error("API request failed", zap.Error(err))
+		}
 		return err
 	}
 
@@ -587,13 +595,13 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 				original := headSHA
 				if mergeCommitSHA != nil && len(*mergeCommitSHA) == 40 {
 					headSHA = *mergeCommitSHA
-					c.logger.Debug("headSHA unresolvable — using merge commit SHA as fallback",
+					c.logger.Info("PR head SHA unresolvable — substituted merge commit SHA",
 						zap.Int("pr_id", pr.ID),
 						zap.String("original_sha", original),
 						zap.String("fallback_sha", headSHA))
 				} else if len(baseSHA) == 40 {
 					headSHA = baseSHA
-					c.logger.Debug("headSHA unresolvable — using base SHA as fallback",
+					c.logger.Info("PR head SHA unresolvable — substituted base branch SHA",
 						zap.Int("pr_id", pr.ID),
 						zap.String("original_sha", original),
 						zap.String("fallback_sha", headSHA))
@@ -602,7 +610,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 						pr.Destination.Branch.Name, pr.CreatedOn)
 					if nearestSHA != "" {
 						headSHA = nearestSHA
-						c.logger.Debug("headSHA unresolvable — using nearest local commit as fallback",
+						c.logger.Info("PR head SHA unresolvable — substituted nearest local commit",
 							zap.Int("pr_id", pr.ID),
 							zap.String("original_sha", original),
 							zap.String("destination_branch", pr.Destination.Branch.Name),
@@ -630,7 +638,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 					// headSHA is already anchored (original or via fallback above);
 					// using it for base is imprecise but keeps the PR importable.
 					baseSHA = headSHA
-					c.logger.Debug("baseSHA unresolvable — using resolved head SHA as fallback",
+					c.logger.Info("PR base SHA unresolvable — substituted resolved head SHA",
 						zap.Int("pr_id", pr.ID),
 						zap.String("original_sha", original),
 						zap.String("fallback_sha", baseSHA))
@@ -639,7 +647,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 						pr.Destination.Branch.Name, pr.CreatedOn)
 					if nearestSHA != "" {
 						baseSHA = nearestSHA
-						c.logger.Debug("baseSHA unresolvable — using nearest local commit as fallback",
+						c.logger.Info("PR base SHA unresolvable — substituted nearest local commit",
 							zap.Int("pr_id", pr.ID),
 							zap.String("original_sha", original),
 							zap.String("destination_branch", pr.Destination.Branch.Name),
