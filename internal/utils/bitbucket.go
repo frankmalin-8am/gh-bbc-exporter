@@ -1012,10 +1012,13 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 				reviews = append(reviews, review)
 			}
 
+			// Fetch the PR commit timeline for the post-approval SOC2 check.
+			commitDates := c.getPRCommits(workspace, repoSlug, prNumber)
+
 			// Build the migration summary comment using the full PR detail.
 			summary := c.buildMigrationSummaryComment(
 				workspace, repoSlug, prNumber,
-				pr, prDetail.Author.DisplayName, prDetail.Participants,
+				pr, prDetail.Author.DisplayName, prDetail.Participants, commitDates,
 			)
 			summaryComments = append(summaryComments, summary)
 			continue
@@ -1042,11 +1045,12 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 
 		// For the summary comment in the fallback path, use the UUID extracted
 		// from pr.User as the author display name (best effort).
+		// Commit timeline is not fetched here — the PR detail call already failed.
 		authorParts := strings.Split(pr.User, "/")
 		authorName := authorParts[len(authorParts)-1]
 		summary := c.buildMigrationSummaryComment(
 			workspace, repoSlug, prNumber,
-			pr, authorName, cached,
+			pr, authorName, cached, nil,
 		)
 		summaryComments = append(summaryComments, summary)
 	}
@@ -1128,6 +1132,40 @@ func formatDateOnly(ts string) string {
 	return ts
 }
 
+// getPRCommits fetches all commit timestamps for a PR from
+// /repositories/{ws}/{repo}/pullrequests/{id}/commits.
+//
+// Commits are returned newest-first by the API; we collect all timestamps so
+// the caller can find the most recent one and count those that landed after a
+// given approval time.  Returns nil (not an error) on any API failure so the
+// caller can degrade gracefully.
+func (c *Client) getPRCommits(workspace, repoSlug, prNumber string) []time.Time {
+	var dates []time.Time
+	endpoint := fmt.Sprintf("repositories/%s/%s/pullrequests/%s/commits?pagelen=50",
+		workspace, repoSlug, prNumber)
+
+	for endpoint != "" {
+		var resp data.BitbucketPRCommitsResponse
+		if err := c.makeRequest("GET", endpoint, &resp); err != nil {
+			c.logger.Warn("getPRCommits: failed to fetch PR commits",
+				zap.String("pr", prNumber),
+				zap.Error(err))
+			return nil
+		}
+		for _, commit := range resp.Values {
+			if t, err := time.Parse(time.RFC3339, commit.Date); err == nil {
+				dates = append(dates, t)
+			} else {
+				c.logger.Debug("getPRCommits: skipping unparseable commit date",
+					zap.String("hash", commit.Hash),
+					zap.String("date", commit.Date))
+			}
+		}
+		endpoint = resp.Next
+	}
+	return dates
+}
+
 // buildMigrationSummaryComment produces an issue_comment that summarises a
 // migrated pull request: who opened it, who approved or requested changes, and
 // when it was closed or merged.
@@ -1140,13 +1178,16 @@ func (c *Client) buildMigrationSummaryComment(
 	pr data.PullRequest,
 	authorDisplayName string,
 	participants []data.BitbucketParticipant,
+	commitDates []time.Time,
 ) data.IssueComment {
 
 	openDate := formatDateOnly(pr.CreatedAt)
 
 	// Collect approval and needs-work participants, skipping the PR author.
+	// Track the latest approval timestamp for the post-approval commit check.
 	var approvers []string
 	var changesRequested []string
+	var lastApprovalTime *time.Time
 	for _, p := range participants {
 		if p.Role == "AUTHOR" {
 			continue
@@ -1161,6 +1202,12 @@ func (c *Client) buildMigrationSummaryComment(
 				approvers = append(approvers, fmt.Sprintf("%s (%s)", name, date))
 			} else {
 				approvers = append(approvers, name)
+			}
+			// Track the most recent approval time for the commit-timeline check.
+			if t, err := time.Parse(time.RFC3339, p.ParticipatedOn); err == nil {
+				if lastApprovalTime == nil || t.After(*lastApprovalTime) {
+					lastApprovalTime = &t
+				}
 			}
 		} else if p.State == "changes_requested" || p.State == "needs_work" {
 			changesRequested = append(changesRequested, name)
@@ -1186,6 +1233,33 @@ func (c *Client) buildMigrationSummaryComment(
 	}
 	if len(changesRequested) > 0 {
 		lines = append(lines, fmt.Sprintf("**Changes requested by:** %s", strings.Join(changesRequested, ", ")))
+	}
+
+	// ── Post-approval commit timeline (SOC2 compliance signal) ───────────
+	// Only shown when we have at least one parseable approval time and commit
+	// data was successfully fetched.  A ⚠️ means commits landed after the
+	// last approval — the reviewer saw a different version than what merged.
+	if lastApprovalTime != nil && commitDates != nil {
+		var commitsAfter int
+		var lastCommitTime time.Time
+		for _, ct := range commitDates {
+			if ct.After(*lastApprovalTime) {
+				commitsAfter++
+			}
+			if ct.After(lastCommitTime) {
+				lastCommitTime = ct
+			}
+		}
+		if commitsAfter == 0 {
+			lines = append(lines, "**Commits after last approval:** none ✅")
+		} else {
+			lines = append(lines, fmt.Sprintf(
+				"**Commits after last approval:** %d ⚠️  (last approval: %s, last commit: %s)",
+				commitsAfter,
+				formatDateOnly(lastApprovalTime.Format(time.RFC3339)),
+				formatDateOnly(lastCommitTime.Format(time.RFC3339)),
+			))
+		}
 	}
 
 	if pr.MergedAt != nil && *pr.MergedAt != "" {
@@ -1233,7 +1307,6 @@ func (c *Client) buildMigrationSummaryComment(
 	}
 }
 
-// getFileDiffAnchor is retained for potential future use but is no longer called
 // getNearestCommitSHA returns the full 40-char SHA of the most recent commit
 // on branchName that was created at or before beforeDate (RFC3339 / ISO-8601).
 // It uses the bare git repo already cloned into the export directory.
@@ -1300,114 +1373,6 @@ func (c *Client) getNearestCommitSHA(workspace, repoSlug, branchName, beforeDate
 	c.logger.Debug("getNearestCommitSHA: branch has no resolvable commits",
 		zap.String("branch", branchName))
 	return ""
-}
-
-// by the approval flow (COMMENTED reviews with a non-empty body import without
-// a linked comment).
-func (c *Client) getFileDiffAnchor(workspace, repoSlug, baseSHA, headSHA, filePath string) (position int, diffHunk string) {
-	// Sensible fallback in case anything goes wrong.
-	position = 1
-	diffHunk = "@@ -0,0 +1,1 @@\n+Approved"
-
-	if baseSHA == "" || headSHA == "" {
-		c.logger.Debug("getFileDiffAnchor: missing SHA, using fallback",
-			zap.String("base", baseSHA), zap.String("head", headSHA))
-		return
-	}
-
-	repoPath := filepath.Join(c.exportDir, "repositories", workspace, repoSlug+".git")
-	if _, err := os.Stat(repoPath); err != nil {
-		c.logger.Debug("getFileDiffAnchor: local git repo not found, using fallback",
-			zap.String("path", repoPath))
-		return
-	}
-
-	out, err := exec.Command(
-		"git", "--git-dir", repoPath,
-		"diff", "--unified=3", "--no-color", baseSHA, headSHA,
-	).Output()
-	if err != nil {
-		c.logger.Warn("getFileDiffAnchor: git diff failed, using fallback",
-			zap.String("base", baseSHA), zap.String("head", headSHA),
-			zap.Error(err))
-		return
-	}
-
-	// Walk the combined diff counting positions until we find our target file.
-	//
-	// Position counter rules (mirrors GitHub's definition):
-	//   - DO count    : @@ hunk headers, + / - / space content lines
-	//   - DO NOT count: diff --git, index, ---, +++, mode/rename/binary headers
-	pos := 0
-	inTargetFile := false
-	foundHunk := false
-	var hunkLines []string
-
-	for _, line := range strings.Split(string(out), "\n") {
-		// ── Per-file separator lines ─────────────────────────────────────
-		if strings.HasPrefix(line, "diff --git ") {
-			if foundHunk {
-				// We already collected what we need; stop.
-				break
-			}
-			// b/path/to/file or b/"path/to/file" (spaces quoted)
-			inTargetFile = strings.Contains(line, " b/"+filePath)
-			continue
-		}
-
-		// These header lines don't count as positions.
-		if strings.HasPrefix(line, "index ") ||
-			strings.HasPrefix(line, "--- ") ||
-			strings.HasPrefix(line, "+++ ") ||
-			strings.HasPrefix(line, "new file mode") ||
-			strings.HasPrefix(line, "deleted file mode") ||
-			strings.HasPrefix(line, "old mode") ||
-			strings.HasPrefix(line, "new mode") ||
-			strings.HasPrefix(line, "similarity index") ||
-			strings.HasPrefix(line, "rename from") ||
-			strings.HasPrefix(line, "rename to") ||
-			strings.HasPrefix(line, "Binary files") {
-			continue
-		}
-
-		// ── Hunk header ──────────────────────────────────────────────────
-		if strings.HasPrefix(line, "@@") {
-			if foundHunk {
-				// Second hunk of target file – we've collected enough context.
-				break
-			}
-			pos++
-			if inTargetFile {
-				foundHunk = true
-				position = pos
-				hunkLines = append(hunkLines, line)
-			}
-			continue
-		}
-
-		// ── Content line ─────────────────────────────────────────────────
-		if len(line) > 0 && (line[0] == '+' || line[0] == '-' || line[0] == ' ') {
-			pos++
-			// Collect up to 4 content lines after the hunk header for context.
-			if foundHunk && len(hunkLines) < 5 {
-				hunkLines = append(hunkLines, line)
-			}
-		}
-	}
-
-	if len(hunkLines) > 0 {
-		diffHunk = strings.Join(hunkLines, "\n")
-		c.logger.Debug("getFileDiffAnchor: computed real diff anchor",
-			zap.String("filePath", filePath),
-			zap.Int("position", position),
-			zap.String("diffHunk", diffHunk))
-	} else {
-		c.logger.Warn("getFileDiffAnchor: file not found in diff, using fallback position",
-			zap.String("filePath", filePath),
-			zap.String("base", baseSHA),
-			zap.String("head", headSHA))
-	}
-	return
 }
 
 

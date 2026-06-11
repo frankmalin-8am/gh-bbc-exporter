@@ -27,14 +27,14 @@ handled:
   none     Pass the unresolvable SHA through as-is.  GEI will silently drop
            any PR it cannot anchor to a commit.
 
-  related  (default) Try the merge-commit SHA first (MERGED PRs only), then
-           fall back to the base-branch SHA.  Both must be full 40-character
-           SHAs; short/unresolvable values are not used as substitutes.
+  related  Try the merge-commit SHA first (MERGED PRs only), then fall back
+           to the base-branch SHA.  Both must be full 40-character SHAs;
+           short/unresolvable values are not used as substitutes.
 
-  nearest  All of 'related', plus a final fallback: find the most recent
-           commit on the destination branch that predates the PR's open date
-           using the locally cloned repository.  Historically approximate but
-           always produces a valid SHA that GEI will accept.`,
+  nearest  (default) All of 'related', plus a final fallback: find the most
+           recent commit on the destination branch that predates the PR's open
+           date using the locally cloned repository.  Historically approximate
+           but always produces a valid SHA that GEI will accept.`,
 		PreRunE: func(exportCmd *cobra.Command, args []string) error {
 			if len(cmdExportFlags.Workspace) == 0 {
 				return errors.New("a bitbucket workspace must be specified")
@@ -89,7 +89,7 @@ handled:
 		"Export pull requests created on or after this date (format: YYYY-MM-DD)")
 	exportCmd.PersistentFlags().BoolVar(&cmdExportFlags.SkipCommitLookup, "skip-commit-lookup", false,
 		"Skip Bitbucket API lookups to retrieve commit SHAs (use local lookup only)")
-	exportCmd.PersistentFlags().StringVar(&cmdExportFlags.SHAFallback, "sha-fallback", "related",
+	exportCmd.PersistentFlags().StringVar(&cmdExportFlags.SHAFallback, "sha-fallback", "nearest",
 		"How to handle PRs with unresolvable commit SHAs: none (pass through, GEI will drop), related (use merge/base SHA), nearest (related + nearest local commit by date)")
 	exportCmd.PersistentFlags().BoolVar(&cmdExportFlags.AllowAmbiguousRefs, "allow-ambiguous-refs", false,
 		"Warn instead of failing when a branch and tag share the same name (checkout behaviour will favour the branch)")
