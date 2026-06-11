@@ -385,6 +385,21 @@ func (c *Client) resolveUserURL(workspace, uuid, nickname, displayName string) s
 	if login == "" {
 		login = cleanUUID // last resort: still unique, just not human-readable
 	}
+
+	// Sanitize the login so the resulting URL is always valid.  Bitbucket
+	// nicknames are normally URL-safe, but some users have display-name-style
+	// nicknames (e.g. "Mario Lopez") that contain spaces.  A URL with a space
+	// is unparseable by GEI and causes the PR transformation to fail.
+	// Replace spaces with hyphens to produce a valid, readable mannequin name.
+	sanitized := strings.ReplaceAll(login, " ", "-")
+	if sanitized != login {
+		c.logger.Warn("Nickname contains spaces — sanitizing for URL",
+			zap.String("uuid", cleanUUID),
+			zap.String("original", login),
+			zap.String("sanitized", sanitized))
+		login = sanitized
+	}
+
 	userURL := fmt.Sprintf("https://bitbucket.org/%s", login)
 
 	// Register so the exporter can add this user to users_000001.json.

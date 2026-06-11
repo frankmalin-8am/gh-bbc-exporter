@@ -1359,6 +1359,31 @@ func TestBuildMigrationSummaryCommentTimeline(t *testing.T) {
 	})
 }
 
+func TestResolveUserURLSanitizesSpacesInNickname(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	client := &Client{
+		logger:          logger,
+		activeUserUUIDs: make(map[string]bool),
+		inactiveUsers:   make(map[string]data.User),
+	}
+
+	// Simulate a user whose Bitbucket nickname contains spaces —
+	// e.g. "Mario Lopez" — which would otherwise produce an invalid URL.
+	url := client.resolveUserURL("myworkspace", "{mario-uuid}", "Mario Lopez", "Mario Lopez")
+
+	assert.NotContains(t, url, " ",
+		"resolved URL must not contain spaces — GEI cannot parse such a URL")
+	assert.Equal(t, "https://bitbucket.org/Mario-Lopez", url,
+		"spaces in nickname should be replaced with hyphens")
+
+	// Confirm the sanitized login is stored in inactiveUsers too,
+	// so users_000001.json gets the same valid URL.
+	user, ok := client.inactiveUsers["mario-uuid"]
+	require.True(t, ok, "inactive user should be registered")
+	assert.Equal(t, "Mario-Lopez", user.Login)
+	assert.Equal(t, "https://bitbucket.org/Mario-Lopez", user.URL)
+}
+
 // mustParseTime parses an RFC3339 timestamp and panics on failure.
 // For use in tests only.
 func mustParseTime(s string) time.Time {
