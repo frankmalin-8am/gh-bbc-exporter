@@ -1155,9 +1155,13 @@ func (c *Client) getPRCommits(workspace, repoSlug, prNumber string) []time.Time 
 	for endpoint != "" {
 		var resp data.BitbucketPRCommitsResponse
 		if err := c.makeRequest("GET", endpoint, &resp); err != nil {
-			c.logger.Warn("getPRCommits: failed to fetch PR commits",
-				zap.String("pr", prNumber),
-				zap.Error(err))
+			// A 404 here almost always means the source branch was deleted
+			// after merge — the commits endpoint requires both ends of the PR
+			// to still exist.  This is expected for old PRs; the consequence
+			// is that the post-approval timeline is omitted from the migration
+			// summary comment for this PR.
+			c.logger.Info("getPRCommits: commit timeline unavailable (source branch likely deleted) — timeline section omitted from migration summary",
+				zap.String("pr", prNumber))
 			return nil
 		}
 		for _, commit := range resp.Values {
