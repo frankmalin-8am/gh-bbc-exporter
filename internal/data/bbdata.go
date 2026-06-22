@@ -155,3 +155,17 @@ type BitbucketParticipantsResponse struct {
 	Values []BitbucketParticipant `json:"values"`
 	Next   string                 `json:"next"`
 }
+
+// BitbucketPRCommit is a single entry from the PR commits endpoint.
+// Only the hash and date are needed for the post-approval timeline check.
+type BitbucketPRCommit struct {
+	Hash string `json:"hash"`
+	Date string `json:"date"`
+}
+
+// BitbucketPRCommitsResponse is the paginated response from
+// /repositories/{ws}/{repo}/pullrequests/{id}/commits.
+type BitbucketPRCommitsResponse struct {
+	Values []BitbucketPRCommit `json:"values"`
+	Next   string              `json:"next"`
+}

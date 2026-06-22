@@ -1272,3 +1272,124 @@ func TestGetUsersAlwaysEmitsEmptyEmailsArray(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildMigrationSummaryCommentTimeline(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	client := &Client{logger: logger}
+
+	mergedAt := "2024-01-20T12:00:00Z"
+	pr := data.PullRequest{
+		URL:       "https://bitbucket.org/ws/repo/pull/42",
+		User:      "https://bitbucket.org/{author-uuid}",
+		CreatedAt: "2024-01-10T08:00:00Z",
+		MergedAt:  &mergedAt,
+	}
+
+	approvedParticipant := data.BitbucketParticipant{
+		User:           data.BitbucketPRUser{DisplayName: "Alice", UUID: "{alice-uuid}"},
+		Role:           "REVIEWER",
+		Approved:       true,
+		State:          "approved",
+		ParticipatedOn: "2024-01-15T10:00:00Z",
+	}
+
+	t.Run("no commits after last approval", func(t *testing.T) {
+		// Two commits both before the approval on Jan 15.
+		commitDates := []time.Time{
+			mustParseTime("2024-01-12T09:00:00Z"),
+			mustParseTime("2024-01-14T11:00:00Z"),
+		}
+		comment := client.buildMigrationSummaryComment(
+			"ws", "repo", "42",
+			pr, "Author Name",
+			[]data.BitbucketParticipant{approvedParticipant},
+			commitDates,
+		)
+		assert.Contains(t, comment.Body, "Commits after last approval:** none ✅",
+			"should show clean signal when no commits followed the approval")
+		assert.NotContains(t, comment.Body, "⚠️")
+	})
+
+	t.Run("commits pushed after last approval", func(t *testing.T) {
+		// Two commits after the approval on Jan 15.
+		commitDates := []time.Time{
+			mustParseTime("2024-01-16T10:00:00Z"),
+			mustParseTime("2024-01-18T14:00:00Z"),
+		}
+		comment := client.buildMigrationSummaryComment(
+			"ws", "repo", "42",
+			pr, "Author Name",
+			[]data.BitbucketParticipant{approvedParticipant},
+			commitDates,
+		)
+		assert.Contains(t, comment.Body, "⚠️",
+			"should flag post-approval commits")
+		assert.Contains(t, comment.Body, "2 ⚠️",
+			"should report the correct count of post-approval commits")
+		assert.Contains(t, comment.Body, "2024-01-18",
+			"should include the last commit date")
+	})
+
+	t.Run("no approvals — timeline section omitted", func(t *testing.T) {
+		commitDates := []time.Time{mustParseTime("2024-01-16T10:00:00Z")}
+		unapproved := data.BitbucketParticipant{
+			User:     data.BitbucketPRUser{DisplayName: "Bob"},
+			Role:     "REVIEWER",
+			Approved: false,
+		}
+		comment := client.buildMigrationSummaryComment(
+			"ws", "repo", "42",
+			pr, "Author Name",
+			[]data.BitbucketParticipant{unapproved},
+			commitDates,
+		)
+		assert.NotContains(t, comment.Body, "Commits after last approval",
+			"timeline section should be omitted when there are no approvals")
+	})
+
+	t.Run("nil commit dates — timeline section omitted", func(t *testing.T) {
+		comment := client.buildMigrationSummaryComment(
+			"ws", "repo", "42",
+			pr, "Author Name",
+			[]data.BitbucketParticipant{approvedParticipant},
+			nil, // no commit data (e.g. API failure)
+		)
+		assert.NotContains(t, comment.Body, "Commits after last approval",
+			"timeline section should be omitted when commit data is unavailable")
+	})
+}
+
+func TestResolveUserURLSanitizesSpacesInNickname(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	client := &Client{
+		logger:          logger,
+		activeUserUUIDs: make(map[string]bool),
+		inactiveUsers:   make(map[string]data.User),
+	}
+
+	// Simulate a user whose Bitbucket nickname contains spaces —
+	// e.g. "Mario Lopez" — which would otherwise produce an invalid URL.
+	url := client.resolveUserURL("myworkspace", "{mario-uuid}", "Mario Lopez", "Mario Lopez")
+
+	assert.NotContains(t, url, " ",
+		"resolved URL must not contain spaces — GEI cannot parse such a URL")
+	assert.Equal(t, "https://bitbucket.org/Mario-Lopez", url,
+		"spaces in nickname should be replaced with hyphens")
+
+	// Confirm the sanitized login is stored in inactiveUsers too,
+	// so users_000001.json gets the same valid URL.
+	user, ok := client.inactiveUsers["mario-uuid"]
+	require.True(t, ok, "inactive user should be registered")
+	assert.Equal(t, "Mario-Lopez", user.Login)
+	assert.Equal(t, "https://bitbucket.org/Mario-Lopez", user.URL)
+}
+
+// mustParseTime parses an RFC3339 timestamp and panics on failure.
+// For use in tests only.
+func mustParseTime(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		panic(fmt.Sprintf("mustParseTime: invalid timestamp %q: %v", s, err))
+	}
+	return t
+}

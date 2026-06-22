@@ -221,11 +221,19 @@ func (c *Client) makeRequest(method, endpoint string, v interface{}) error {
 			return json.NewDecoder(resp.Body).Decode(v)
 		}
 
-		// Handle other errors
+		// Handle other errors.  404s are logged at DEBUG because callers
+		// frequently expect them (GC'd commits, deleted branches) and handle
+		// them gracefully with fallback logic.  All other non-2xx statuses
+		// are genuine errors and warrant ERROR level.
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		err = fmt.Errorf("API request failed with status %d: %s: %s",
 			resp.StatusCode, resp.Status, string(bodyBytes))
-		c.logger.Error("API request failed", zap.Error(err))
+		if resp.StatusCode == 404 {
+			c.logger.Debug("API request returned 404 (caller will handle)",
+				zap.String("url", fullURL))
+		} else {
+			c.logger.Error("API request failed", zap.Error(err))
+		}
 		return err
 	}
 
@@ -377,6 +385,21 @@ func (c *Client) resolveUserURL(workspace, uuid, nickname, displayName string) s
 	if login == "" {
 		login = cleanUUID // last resort: still unique, just not human-readable
 	}
+
+	// Sanitize the login so the resulting URL is always valid.  Bitbucket
+	// nicknames are normally URL-safe, but some users have display-name-style
+	// nicknames (e.g. "Mario Lopez") that contain spaces.  A URL with a space
+	// is unparseable by GEI and causes the PR transformation to fail.
+	// Replace spaces with hyphens to produce a valid, readable mannequin name.
+	sanitized := strings.ReplaceAll(login, " ", "-")
+	if sanitized != login {
+		c.logger.Warn("Nickname contains spaces — sanitizing for URL",
+			zap.String("uuid", cleanUUID),
+			zap.String("original", login),
+			zap.String("sanitized", sanitized))
+		login = sanitized
+	}
+
 	userURL := fmt.Sprintf("https://bitbucket.org/%s", login)
 
 	// Register so the exporter can add this user to users_000001.json.
@@ -553,20 +576,37 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 			baseSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Destination.Commit.Hash)
 			headSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Source.Commit.Hash)
 
+			// A 40-char SHA returned by the Bitbucket API is not necessarily
+			// present in the local clone: the commit may have been GC'd on
+			// Bitbucket's side after our clone was made.  GEI would fail with
+			// REF_NOT_FOUND because the object doesn't exist in the imported repo.
+			// Reset to "" so the fallback logic below treats it as unresolvable.
+			if len(baseSHA) == 40 && !c.localCommitExists(workspace, repoSlug, baseSHA) {
+				c.logger.Debug("baseSHA not present in local clone — treating as unresolvable for fallback",
+					zap.Int("pr_id", pr.ID),
+					zap.String("sha", baseSHA))
+				baseSHA = ""
+			}
+			if len(headSHA) == 40 && !c.localCommitExists(workspace, repoSlug, headSHA) {
+				c.logger.Debug("headSHA not present in local clone — treating as unresolvable for fallback",
+					zap.Int("pr_id", pr.ID),
+					zap.String("sha", headSHA))
+				headSHA = ""
+			}
+
 			// Format merge commit SHA if available.  This must be resolved before
 			// the headSHA fallback below so it can be used as the fallback value.
-			// If the merge commit is unresolvable (short SHA), leave the pointer nil
-			// rather than storing a dangling reference — GEI treats nil the same as
-			// an absent field, which is cleaner than an invalid short SHA.
+			// If the merge commit is unresolvable (short SHA or absent from local
+			// clone), leave the pointer nil rather than storing a dangling reference.
 			var mergeCommitSHA *string
 			if pr.MergeCommit != nil && pr.State == "MERGED" {
 				fullMergeSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.MergeCommit.Hash)
-				if len(fullMergeSHA) == 40 {
+				if len(fullMergeSHA) == 40 && c.localCommitExists(workspace, repoSlug, fullMergeSHA) {
 					mergeCommitSHA = &fullMergeSHA
 				} else {
-					c.logger.Debug("merge commit SHA unresolvable — omitting from export",
+					c.logger.Debug("merge commit SHA unresolvable or absent from local clone — omitting from export",
 						zap.Int("pr_id", pr.ID),
-						zap.String("short_sha", fullMergeSHA))
+						zap.String("sha", fullMergeSHA))
 				}
 			}
 
@@ -587,13 +627,13 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 				original := headSHA
 				if mergeCommitSHA != nil && len(*mergeCommitSHA) == 40 {
 					headSHA = *mergeCommitSHA
-					c.logger.Debug("headSHA unresolvable — using merge commit SHA as fallback",
+					c.logger.Info("PR head SHA unresolvable — substituted merge commit SHA",
 						zap.Int("pr_id", pr.ID),
 						zap.String("original_sha", original),
 						zap.String("fallback_sha", headSHA))
 				} else if len(baseSHA) == 40 {
 					headSHA = baseSHA
-					c.logger.Debug("headSHA unresolvable — using base SHA as fallback",
+					c.logger.Info("PR head SHA unresolvable — substituted base branch SHA",
 						zap.Int("pr_id", pr.ID),
 						zap.String("original_sha", original),
 						zap.String("fallback_sha", headSHA))
@@ -602,7 +642,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 						pr.Destination.Branch.Name, pr.CreatedOn)
 					if nearestSHA != "" {
 						headSHA = nearestSHA
-						c.logger.Debug("headSHA unresolvable — using nearest local commit as fallback",
+						c.logger.Info("PR head SHA unresolvable — substituted nearest local commit",
 							zap.Int("pr_id", pr.ID),
 							zap.String("original_sha", original),
 							zap.String("destination_branch", pr.Destination.Branch.Name),
@@ -630,7 +670,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 					// headSHA is already anchored (original or via fallback above);
 					// using it for base is imprecise but keeps the PR importable.
 					baseSHA = headSHA
-					c.logger.Debug("baseSHA unresolvable — using resolved head SHA as fallback",
+					c.logger.Info("PR base SHA unresolvable — substituted resolved head SHA",
 						zap.Int("pr_id", pr.ID),
 						zap.String("original_sha", original),
 						zap.String("fallback_sha", baseSHA))
@@ -639,7 +679,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 						pr.Destination.Branch.Name, pr.CreatedOn)
 					if nearestSHA != "" {
 						baseSHA = nearestSHA
-						c.logger.Debug("baseSHA unresolvable — using nearest local commit as fallback",
+						c.logger.Info("PR base SHA unresolvable — substituted nearest local commit",
 							zap.Int("pr_id", pr.ID),
 							zap.String("original_sha", original),
 							zap.String("destination_branch", pr.Destination.Branch.Name),
@@ -719,6 +759,20 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 		zap.Int("skipped_by_date", skippedByDate))
 
 	return pullRequests, nil
+}
+
+// localCommitExists reports whether sha is a reachable object in the
+// locally-cloned bare repository.  It is used to detect the case where the
+// Bitbucket API returns a valid 40-char SHA for a commit that was GC'd on
+// Bitbucket's side before our clone was made — the object is absent from the
+// clone, and therefore from the GitHub repo that GEI creates, causing a
+// REF_NOT_FOUND error at import time.
+func (c *Client) localCommitExists(workspace, repoSlug, sha string) bool {
+	if len(sha) != 40 {
+		return false
+	}
+	repoPath := filepath.Join(c.exportDir, "repositories", workspace, repoSlug+".git")
+	return exec.Command("git", "--git-dir", repoPath, "cat-file", "-t", sha).Run() == nil
 }
 
 func (c *Client) GetFullCommitSHA(workspace, repoSlug, commitHash string) (string, error) {
@@ -1012,10 +1066,13 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 				reviews = append(reviews, review)
 			}
 
+			// Fetch the PR commit timeline for the post-approval SOC2 check.
+			commitDates := c.getPRCommits(workspace, repoSlug, prNumber)
+
 			// Build the migration summary comment using the full PR detail.
 			summary := c.buildMigrationSummaryComment(
 				workspace, repoSlug, prNumber,
-				pr, prDetail.Author.DisplayName, prDetail.Participants,
+				pr, prDetail.Author.DisplayName, prDetail.Participants, commitDates,
 			)
 			summaryComments = append(summaryComments, summary)
 			continue
@@ -1042,11 +1099,12 @@ func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequest
 
 		// For the summary comment in the fallback path, use the UUID extracted
 		// from pr.User as the author display name (best effort).
+		// Commit timeline is not fetched here — the PR detail call already failed.
 		authorParts := strings.Split(pr.User, "/")
 		authorName := authorParts[len(authorParts)-1]
 		summary := c.buildMigrationSummaryComment(
 			workspace, repoSlug, prNumber,
-			pr, authorName, cached,
+			pr, authorName, cached, nil,
 		)
 		summaryComments = append(summaryComments, summary)
 	}
@@ -1128,6 +1186,44 @@ func formatDateOnly(ts string) string {
 	return ts
 }
 
+// getPRCommits fetches all commit timestamps for a PR from
+// /repositories/{ws}/{repo}/pullrequests/{id}/commits.
+//
+// Commits are returned newest-first by the API; we collect all timestamps so
+// the caller can find the most recent one and count those that landed after a
+// given approval time.  Returns nil (not an error) on any API failure so the
+// caller can degrade gracefully.
+func (c *Client) getPRCommits(workspace, repoSlug, prNumber string) []time.Time {
+	var dates []time.Time
+	endpoint := fmt.Sprintf("repositories/%s/%s/pullrequests/%s/commits?pagelen=50",
+		workspace, repoSlug, prNumber)
+
+	for endpoint != "" {
+		var resp data.BitbucketPRCommitsResponse
+		if err := c.makeRequest("GET", endpoint, &resp); err != nil {
+			// A 404 here almost always means the source branch was deleted
+			// after merge — the commits endpoint requires both ends of the PR
+			// to still exist.  This is expected for old PRs; the consequence
+			// is that the post-approval timeline is omitted from the migration
+			// summary comment for this PR.
+			c.logger.Info("getPRCommits: commit timeline unavailable (source branch likely deleted) — timeline section omitted from migration summary",
+				zap.String("pr", prNumber))
+			return nil
+		}
+		for _, commit := range resp.Values {
+			if t, err := time.Parse(time.RFC3339, commit.Date); err == nil {
+				dates = append(dates, t)
+			} else {
+				c.logger.Debug("getPRCommits: skipping unparseable commit date",
+					zap.String("hash", commit.Hash),
+					zap.String("date", commit.Date))
+			}
+		}
+		endpoint = resp.Next
+	}
+	return dates
+}
+
 // buildMigrationSummaryComment produces an issue_comment that summarises a
 // migrated pull request: who opened it, who approved or requested changes, and
 // when it was closed or merged.
@@ -1140,13 +1236,16 @@ func (c *Client) buildMigrationSummaryComment(
 	pr data.PullRequest,
 	authorDisplayName string,
 	participants []data.BitbucketParticipant,
+	commitDates []time.Time,
 ) data.IssueComment {
 
 	openDate := formatDateOnly(pr.CreatedAt)
 
 	// Collect approval and needs-work participants, skipping the PR author.
+	// Track the latest approval timestamp for the post-approval commit check.
 	var approvers []string
 	var changesRequested []string
+	var lastApprovalTime *time.Time
 	for _, p := range participants {
 		if p.Role == "AUTHOR" {
 			continue
@@ -1161,6 +1260,12 @@ func (c *Client) buildMigrationSummaryComment(
 				approvers = append(approvers, fmt.Sprintf("%s (%s)", name, date))
 			} else {
 				approvers = append(approvers, name)
+			}
+			// Track the most recent approval time for the commit-timeline check.
+			if t, err := time.Parse(time.RFC3339, p.ParticipatedOn); err == nil {
+				if lastApprovalTime == nil || t.After(*lastApprovalTime) {
+					lastApprovalTime = &t
+				}
 			}
 		} else if p.State == "changes_requested" || p.State == "needs_work" {
 			changesRequested = append(changesRequested, name)
@@ -1186,6 +1291,33 @@ func (c *Client) buildMigrationSummaryComment(
 	}
 	if len(changesRequested) > 0 {
 		lines = append(lines, fmt.Sprintf("**Changes requested by:** %s", strings.Join(changesRequested, ", ")))
+	}
+
+	// ── Post-approval commit timeline (SOC2 compliance signal) ───────────
+	// Only shown when we have at least one parseable approval time and commit
+	// data was successfully fetched.  A ⚠️ means commits landed after the
+	// last approval — the reviewer saw a different version than what merged.
+	if lastApprovalTime != nil && commitDates != nil {
+		var commitsAfter int
+		var lastCommitTime time.Time
+		for _, ct := range commitDates {
+			if ct.After(*lastApprovalTime) {
+				commitsAfter++
+			}
+			if ct.After(lastCommitTime) {
+				lastCommitTime = ct
+			}
+		}
+		if commitsAfter == 0 {
+			lines = append(lines, "**Commits after last approval:** none ✅")
+		} else {
+			lines = append(lines, fmt.Sprintf(
+				"**Commits after last approval:** %d ⚠️  (last approval: %s, last commit: %s)",
+				commitsAfter,
+				formatDateOnly(lastApprovalTime.Format(time.RFC3339)),
+				formatDateOnly(lastCommitTime.Format(time.RFC3339)),
+			))
+		}
 	}
 
 	if pr.MergedAt != nil && *pr.MergedAt != "" {
@@ -1233,7 +1365,6 @@ func (c *Client) buildMigrationSummaryComment(
 	}
 }
 
-// getFileDiffAnchor is retained for potential future use but is no longer called
 // getNearestCommitSHA returns the full 40-char SHA of the most recent commit
 // on branchName that was created at or before beforeDate (RFC3339 / ISO-8601).
 // It uses the bare git repo already cloned into the export directory.
@@ -1297,117 +1428,49 @@ func (c *Client) getNearestCommitSHA(workspace, repoSlug, branchName, beforeDate
 		}
 	}
 
-	c.logger.Debug("getNearestCommitSHA: branch has no resolvable commits",
-		zap.String("branch", branchName))
-	return ""
-}
-
-// by the approval flow (COMMENTED reviews with a non-empty body import without
-// a linked comment).
-func (c *Client) getFileDiffAnchor(workspace, repoSlug, baseSHA, headSHA, filePath string) (position int, diffHunk string) {
-	// Sensible fallback in case anything goes wrong.
-	position = 1
-	diffHunk = "@@ -0,0 +1,1 @@\n+Approved"
-
-	if baseSHA == "" || headSHA == "" {
-		c.logger.Debug("getFileDiffAnchor: missing SHA, using fallback",
-			zap.String("base", baseSHA), zap.String("head", headSHA))
-		return
-	}
-
-	repoPath := filepath.Join(c.exportDir, "repositories", workspace, repoSlug+".git")
-	if _, err := os.Stat(repoPath); err != nil {
-		c.logger.Debug("getFileDiffAnchor: local git repo not found, using fallback",
-			zap.String("path", repoPath))
-		return
-	}
+	// ── Last resort: branch no longer exists in the clone ──────────────────
+	// The destination branch was deleted and its objects GC'd (common when a
+	// PR targeted another topic branch that was itself later merged).  Search
+	// across ALL refs for the most recent commit that predates the PR's open
+	// date.  This is historically approximate but always yields a valid
+	// 40-char SHA, which is what GEI needs to anchor the PR.
+	c.logger.Debug("getNearestCommitSHA: branch not found in clone, falling back to all-refs search",
+		zap.String("branch", branchName),
+		zap.String("before", dateStr))
 
 	out, err := exec.Command(
 		"git", "--git-dir", repoPath,
-		"diff", "--unified=3", "--no-color", baseSHA, headSHA,
+		"log", "--all", "--before="+dateStr, "--format=%H", "-1",
 	).Output()
-	if err != nil {
-		c.logger.Warn("getFileDiffAnchor: git diff failed, using fallback",
-			zap.String("base", baseSHA), zap.String("head", headSHA),
-			zap.Error(err))
-		return
-	}
-
-	// Walk the combined diff counting positions until we find our target file.
-	//
-	// Position counter rules (mirrors GitHub's definition):
-	//   - DO count    : @@ hunk headers, + / - / space content lines
-	//   - DO NOT count: diff --git, index, ---, +++, mode/rename/binary headers
-	pos := 0
-	inTargetFile := false
-	foundHunk := false
-	var hunkLines []string
-
-	for _, line := range strings.Split(string(out), "\n") {
-		// ── Per-file separator lines ─────────────────────────────────────
-		if strings.HasPrefix(line, "diff --git ") {
-			if foundHunk {
-				// We already collected what we need; stop.
-				break
-			}
-			// b/path/to/file or b/"path/to/file" (spaces quoted)
-			inTargetFile = strings.Contains(line, " b/"+filePath)
-			continue
-		}
-
-		// These header lines don't count as positions.
-		if strings.HasPrefix(line, "index ") ||
-			strings.HasPrefix(line, "--- ") ||
-			strings.HasPrefix(line, "+++ ") ||
-			strings.HasPrefix(line, "new file mode") ||
-			strings.HasPrefix(line, "deleted file mode") ||
-			strings.HasPrefix(line, "old mode") ||
-			strings.HasPrefix(line, "new mode") ||
-			strings.HasPrefix(line, "similarity index") ||
-			strings.HasPrefix(line, "rename from") ||
-			strings.HasPrefix(line, "rename to") ||
-			strings.HasPrefix(line, "Binary files") {
-			continue
-		}
-
-		// ── Hunk header ──────────────────────────────────────────────────
-		if strings.HasPrefix(line, "@@") {
-			if foundHunk {
-				// Second hunk of target file – we've collected enough context.
-				break
-			}
-			pos++
-			if inTargetFile {
-				foundHunk = true
-				position = pos
-				hunkLines = append(hunkLines, line)
-			}
-			continue
-		}
-
-		// ── Content line ─────────────────────────────────────────────────
-		if len(line) > 0 && (line[0] == '+' || line[0] == '-' || line[0] == ' ') {
-			pos++
-			// Collect up to 4 content lines after the hunk header for context.
-			if foundHunk && len(hunkLines) < 5 {
-				hunkLines = append(hunkLines, line)
-			}
+	if err == nil {
+		sha := strings.TrimSpace(string(out))
+		if len(sha) == 40 {
+			c.logger.Warn("getNearestCommitSHA: destination branch gone — anchoring to nearest commit across all refs (historically approximate)",
+				zap.String("missing_branch", branchName),
+				zap.String("before", dateStr),
+				zap.String("fallback_sha", sha))
+			return sha
 		}
 	}
 
-	if len(hunkLines) > 0 {
-		diffHunk = strings.Join(hunkLines, "\n")
-		c.logger.Debug("getFileDiffAnchor: computed real diff anchor",
-			zap.String("filePath", filePath),
-			zap.Int("position", position),
-			zap.String("diffHunk", diffHunk))
-	} else {
-		c.logger.Warn("getFileDiffAnchor: file not found in diff, using fallback position",
-			zap.String("filePath", filePath),
-			zap.String("base", baseSHA),
-			zap.String("head", headSHA))
+	// Absolute last resort: oldest commit anywhere in the repo.
+	out, err = exec.Command(
+		"git", "--git-dir", repoPath,
+		"log", "--all", "--reverse", "--format=%H", "-1",
+	).Output()
+	if err == nil {
+		sha := strings.TrimSpace(string(out))
+		if len(sha) == 40 {
+			c.logger.Warn("getNearestCommitSHA: no commit predates PR open date — using oldest commit in repo",
+				zap.String("missing_branch", branchName),
+				zap.String("fallback_sha", sha))
+			return sha
+		}
 	}
-	return
+
+	c.logger.Debug("getNearestCommitSHA: branch has no resolvable commits",
+		zap.String("branch", branchName))
+	return ""
 }
 
 
