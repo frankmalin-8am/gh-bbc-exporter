@@ -31,7 +31,7 @@ func TestMigrateExportIntegration(t *testing.T) {
 	defer testServer.Close()
 
 	logger, _ := zap.NewDevelopment()
-	client := NewClient(testServer.URL, "token", "", "", "", "", logger, tempDir, false)
+	client := NewClient(testServer.URL, "token", "", "", "", "", logger, tempDir, false, "related")
 
 	assert.NotNil(t, client)
 	assert.Equal(t, testServer.URL, client.baseURL)
@@ -241,7 +241,7 @@ func TestMigrateSkipCommitLookup(t *testing.T) {
 	defer testServer.Close()
 
 	logger, _ := zap.NewDevelopment()
-	client := NewClient(testServer.URL, "token", "", "", "", "", logger, tempDir, true)
+	client := NewClient(testServer.URL, "token", "", "", "", "", logger, tempDir, true, "related")
 
 	assert.True(t, client.skipCommitLookup)
 }

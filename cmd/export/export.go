@@ -17,7 +17,24 @@ func NewCmdExport() *cobra.Command {
 	exportCmd := &cobra.Command{
 		Use:   "export [flags]",
 		Short: "Export repository and metadata from Bitbucket Cloud",
-		Long:  "Export repository and metadata from Bitbucket Cloud for GitHub Cloud import.",
+		Long: `Export repository and metadata from Bitbucket Cloud for GitHub Cloud import.
+
+Pull requests whose commit SHAs can no longer be resolved (e.g. objects GC'd
+after branch deletion) would otherwise be silently dropped by the GitHub
+Enterprise Importer (GEI).  The --sha-fallback flag controls how these are
+handled:
+
+  none     Pass the unresolvable SHA through as-is.  GEI will silently drop
+           any PR it cannot anchor to a commit.
+
+  related  Try the merge-commit SHA first (MERGED PRs only), then fall back
+           to the base-branch SHA.  Both must be full 40-character SHAs;
+           short/unresolvable values are not used as substitutes.
+
+  nearest  (default) All of 'related', plus a final fallback: find the most
+           recent commit on the destination branch that predates the PR's open
+           date using the locally cloned repository.  Historically approximate
+           but always produces a valid SHA that GEI will accept.`,
 		PreRunE: func(exportCmd *cobra.Command, args []string) error {
 			if len(cmdExportFlags.Workspace) == 0 {
 				return errors.New("a bitbucket workspace must be specified")
@@ -72,6 +89,10 @@ func NewCmdExport() *cobra.Command {
 		"Export pull requests created on or after this date (format: YYYY-MM-DD)")
 	exportCmd.PersistentFlags().BoolVar(&cmdExportFlags.SkipCommitLookup, "skip-commit-lookup", false,
 		"Skip Bitbucket API lookups to retrieve commit SHAs (use local lookup only)")
+	exportCmd.PersistentFlags().StringVar(&cmdExportFlags.SHAFallback, "sha-fallback", "nearest",
+		"How to handle PRs with unresolvable commit SHAs: none (pass through, GEI will drop), related (use merge/base SHA), nearest (related + nearest local commit by date)")
+	exportCmd.PersistentFlags().BoolVar(&cmdExportFlags.AllowAmbiguousRefs, "allow-ambiguous-refs", false,
+		"Warn instead of failing when a branch and tag share the same name (checkout behaviour will favour the branch)")
 	exportCmd.PersistentFlags().BoolVarP(&cmdExportFlags.Debug, "debug", "d", false, "Enable debug logging")
 
 	if err := exportCmd.MarkPersistentFlagRequired("workspace"); err != nil {
@@ -115,6 +136,7 @@ func runCmdExport(cmdExportFlags *data.CmdExportFlags, logger *zap.Logger) error
 		logger,
 		cmdExportFlags.OutputDir,
 		cmdExportFlags.SkipCommitLookup,
+		cmdExportFlags.SHAFallback,
 	)
 
 	if cmdExportFlags.OpenPRsOnly {
@@ -128,8 +150,13 @@ func runCmdExport(cmdExportFlags *data.CmdExportFlags, logger *zap.Logger) error
 	if cmdExportFlags.SkipCommitLookup {
 		logger.Info("Skipping Bitbucket API commit SHA lookups (will look locally only)")
 	}
+	logger.Info("SHA fallback mode", zap.String("sha_fallback", cmdExportFlags.SHAFallback))
 
 	exporter := utils.NewExporter(client, cmdExportFlags.OutputDir, logger, cmdExportFlags.OpenPRsOnly, cmdExportFlags.PRsFromDate)
+	if cmdExportFlags.AllowAmbiguousRefs {
+		exporter.SetAllowAmbiguousRefs(true)
+		logger.Info("Ambiguous ref check: branch/tag name collisions will be warned, not failed (--allow-ambiguous-refs)")
+	}
 
 	if cmdExportFlags.TempDir != "" {
 		exporter.SetTempDir(cmdExportFlags.TempDir)

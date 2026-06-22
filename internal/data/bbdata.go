@@ -13,7 +13,9 @@ type CmdExportFlags struct {
 	TempDir              string
 	PRsFromDate          string // Format: YYYY-MM-DD
 	OpenPRsOnly          bool
-	SkipCommitLookup     bool // If true, do not call Bitbucket Cloud API to retrieve commit SHAs
+	SkipCommitLookup     bool   // If true, do not call Bitbucket Cloud API to retrieve commit SHAs
+	SHAFallback          string // How to handle unresolvable commit SHAs: "none", "related", "nearest"
+	AllowAmbiguousRefs   bool   // If true, warn instead of failing when a branch and tag share the same name
 	Debug                bool
 }
 
@@ -47,20 +49,23 @@ type BitbucketPRResponse struct {
 }
 
 type BitbucketPR struct {
-	ID                int                 `json:"id"`
-	Title             string              `json:"title"`
-	Description       *string             `json:"description"`
-	State             string              `json:"state"`
-	CreatedOn         string              `json:"created_on"`
-	UpdatedOn         string              `json:"updated_on"`
-	Draft             bool                `json:"draft"`
-	CommentCount      int                 `json:"comment_count"`
-	CloseSourceBranch bool                `json:"close_source_branch"`
-	Source            BitbucketPREndpoint `json:"source"`
-	Destination       BitbucketPREndpoint `json:"destination"`
-	MergeCommit       *BitbucketCommit    `json:"merge_commit"`
-	Author            BitbucketPRUser     `json:"author"`
-	ClosedBy          *BitbucketPRUser    `json:"closed_by"`
+	ID                int                   `json:"id"`
+	Title             string                `json:"title"`
+	Description       *string               `json:"description"`
+	State             string                `json:"state"`
+	CreatedOn         string                `json:"created_on"`
+	UpdatedOn         string                `json:"updated_on"`
+	Draft             bool                  `json:"draft"`
+	CommentCount      int                   `json:"comment_count"`
+	CloseSourceBranch bool                  `json:"close_source_branch"`
+	Source            BitbucketPREndpoint   `json:"source"`
+	Destination       BitbucketPREndpoint   `json:"destination"`
+	MergeCommit       *BitbucketCommit      `json:"merge_commit"`
+	Author            BitbucketPRUser       `json:"author"`
+	ClosedBy          *BitbucketPRUser      `json:"closed_by"`
+	// Participants is embedded in the PR response and is the most reliable
+	// source for approval data — no separate API call required.
+	Participants      []BitbucketParticipant `json:"participants"`
 }
 
 type BitbucketPREndpoint struct {
@@ -136,4 +141,31 @@ type Inline struct {
 	From *int   `json:"from"`
 	To   *int   `json:"to"`
 	Path string `json:"path"`
+}
+
+type BitbucketParticipant struct {
+	User              BitbucketPRUser `json:"user"`
+	Role              string          `json:"role"`
+	Approved          bool            `json:"approved"`
+	State             string          `json:"state"` // "approved", "changes_requested", "needs_work", null
+	ParticipatedOn    string          `json:"participated_on"`
+}
+
+type BitbucketParticipantsResponse struct {
+	Values []BitbucketParticipant `json:"values"`
+	Next   string                 `json:"next"`
+}
+
+// BitbucketPRCommit is a single entry from the PR commits endpoint.
+// Only the hash and date are needed for the post-approval timeline check.
+type BitbucketPRCommit struct {
+	Hash string `json:"hash"`
+	Date string `json:"date"`
+}
+
+// BitbucketPRCommitsResponse is the paginated response from
+// /repositories/{ws}/{repo}/pullrequests/{id}/commits.
+type BitbucketPRCommitsResponse struct {
+	Values []BitbucketPRCommit `json:"values"`
+	Next   string              `json:"next"`
 }

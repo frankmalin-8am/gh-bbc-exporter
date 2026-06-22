@@ -3,10 +3,12 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -27,11 +29,26 @@ type Client struct {
 	appPass          string // To be deprecated Sept 2025
 	logger           *zap.Logger
 	commitSHACache   map[string]string
-	exportDir        string
-	skipCommitLookup bool
+	// prParticipantsCache stores the Bitbucket participants embedded in each
+	// PR response, keyed by the GitHub-format PR URL (e.g.
+	// "https://bitbucket.org/ws/repo/pull/22").  Populated during GetPullRequests
+	// and consumed by GetPullRequestApprovals so no extra API call is needed.
+	prParticipantsCache map[string][]data.BitbucketParticipant
+	exportDir           string
+	skipCommitLookup    bool
+	shaFallback         string // "none" | "related" | "nearest"
+	// activeUserUUIDs is the set of UUIDs (braces stripped) that are current
+	// workspace members.  Populated by GetUsers so that GetPullRequests and
+	// GetPullRequestComments can choose the right URL format per user.
+	activeUserUUIDs map[string]bool
+	// inactiveUsers collects users referenced in PRs/comments whose UUID is not
+	// in activeUserUUIDs.  They are emitted with a nickname-based URL so that
+	// the resulting mannequin in GitHub has a human-readable name.  Keyed by
+	// clean UUID (no braces).
+	inactiveUsers map[string]data.User
 }
 
-func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, logger *zap.Logger, exportDir string, skipCommitLookup bool) *Client {
+func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, logger *zap.Logger, exportDir string, skipCommitLookup bool, shaFallback string) *Client {
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	if !strings.Contains(baseURL, "/2.0") && strings.Contains(baseURL, "api.bitbucket.org") {
@@ -58,17 +75,21 @@ func NewClient(baseURL, accessToken, apiToken, email, username, appPass string, 
 		zap.String("authMethod", authMethod))
 
 	return &Client{
-		baseURL:          baseURL,
-		httpClient:       &http.Client{},
-		accessToken:      accessToken,
-		apiToken:         apiToken,
-		email:            email,
-		username:         username,
-		appPass:          appPass,
-		logger:           logger,
-		commitSHACache:   make(map[string]string),
-		exportDir:        exportDir,
-		skipCommitLookup: skipCommitLookup,
+		baseURL:             baseURL,
+		httpClient:          &http.Client{},
+		accessToken:         accessToken,
+		apiToken:            apiToken,
+		email:               email,
+		username:            username,
+		appPass:             appPass,
+		logger:              logger,
+		commitSHACache:      make(map[string]string),
+		prParticipantsCache: make(map[string][]data.BitbucketParticipant),
+		exportDir:           exportDir,
+		skipCommitLookup:    skipCommitLookup,
+		shaFallback:         shaFallback,
+		activeUserUUIDs:     make(map[string]bool),
+		inactiveUsers:       make(map[string]data.User),
 	}
 }
 
@@ -200,11 +221,19 @@ func (c *Client) makeRequest(method, endpoint string, v interface{}) error {
 			return json.NewDecoder(resp.Body).Decode(v)
 		}
 
-		// Handle other errors
+		// Handle other errors.  404s are logged at DEBUG because callers
+		// frequently expect them (GC'd commits, deleted branches) and handle
+		// them gracefully with fallback logic.  All other non-2xx statuses
+		// are genuine errors and warrant ERROR level.
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		err = fmt.Errorf("API request failed with status %d: %s: %s",
 			resp.StatusCode, resp.Status, string(bodyBytes))
-		c.logger.Error("API request failed", zap.Error(err))
+		if resp.StatusCode == 404 {
+			c.logger.Debug("API request returned 404 (caller will handle)",
+				zap.String("url", fullURL))
+		} else {
+			c.logger.Error("API request failed", zap.Error(err))
+		}
 		return err
 	}
 
@@ -284,10 +313,127 @@ func (c *Client) GetUsers(workspace, repoSlug string) ([]data.User, error) {
 		})
 	}
 
+	// Always ensure the workspace system user is present so that migration
+	// summary comments (attributed to this URL) resolve to a valid mannequin.
+	wsURL := fmt.Sprintf("https://bitbucket.org/%s", workspace)
+	found := false
+	for _, u := range allUsers {
+		if u.URL == wsURL {
+			found = true
+			break
+		}
+	}
+	if !found {
+		allUsers = append(allUsers, data.User{
+			Type:      "user",
+			URL:       wsURL,
+			Login:     workspace,
+			Name:      workspace,
+			Company:   nil,
+			Website:   nil,
+			Location:  nil,
+			Emails:    []data.Email{},
+			CreatedAt: formatDateToZ(time.Now().Format(time.RFC3339)),
+		})
+		c.logger.Debug("Added workspace system user for migration attribution",
+			zap.String("url", wsURL))
+	}
+
+	// Cache active UUIDs so GetPullRequests / GetPullRequestComments can
+	// distinguish current members from former members.
+	if c.activeUserUUIDs == nil {
+		c.activeUserUUIDs = make(map[string]bool)
+	}
+	for _, u := range allUsers {
+		if u.Login != "" && u.Login != workspace {
+			c.activeUserUUIDs[u.Login] = true
+		}
+	}
+
 	c.logger.Debug("Fetched workspace members",
 		zap.Int("count", len(allUsers)))
 
 	return allUsers, nil
+}
+
+// resolveUserURL returns the canonical URL for a Bitbucket user in the GEI
+// archive format.  For users who are still active workspace members the URL
+// is UUID-based (https://bitbucket.org/<uuid>), which lets the mannequin be
+// reclaimed by the real GitHub user later.  For users who have left the
+// workspace the URL is nickname-based (https://bitbucket.org/<nickname>),
+// which produces a human-readable mannequin name instead of an opaque UUID.
+// Inactive users are registered in c.inactiveUsers so the exporter can append
+// them to users_000001.json.
+func (c *Client) resolveUserURL(workspace, uuid, nickname, displayName string) string {
+	// Lazy-initialize maps so tests that build Client literals directly still work.
+	if c.activeUserUUIDs == nil {
+		c.activeUserUUIDs = make(map[string]bool)
+	}
+	if c.inactiveUsers == nil {
+		c.inactiveUsers = make(map[string]data.User)
+	}
+
+	cleanUUID := strings.Trim(uuid, "{}")
+
+	if c.activeUserUUIDs[cleanUUID] {
+		// Active member — keep UUID-based URL for mannequin reclaim support.
+		return fmt.Sprintf("https://bitbucket.org/%s", cleanUUID)
+	}
+
+	// Inactive / unknown user — fall back to nickname for readability.
+	login := nickname
+	if login == "" {
+		login = cleanUUID // last resort: still unique, just not human-readable
+	}
+
+	// Sanitize the login so the resulting URL is always valid.  Bitbucket
+	// nicknames are normally URL-safe, but some users have display-name-style
+	// nicknames (e.g. "Mario Lopez") that contain spaces.  A URL with a space
+	// is unparseable by GEI and causes the PR transformation to fail.
+	// Replace spaces with hyphens to produce a valid, readable mannequin name.
+	sanitized := strings.ReplaceAll(login, " ", "-")
+	if sanitized != login {
+		c.logger.Warn("Nickname contains spaces — sanitizing for URL",
+			zap.String("uuid", cleanUUID),
+			zap.String("original", login),
+			zap.String("sanitized", sanitized))
+		login = sanitized
+	}
+
+	userURL := fmt.Sprintf("https://bitbucket.org/%s", login)
+
+	// Register so the exporter can add this user to users_000001.json.
+	if _, known := c.inactiveUsers[cleanUUID]; !known {
+		name := displayName
+		if name == "" {
+			name = login
+		}
+		c.inactiveUsers[cleanUUID] = data.User{
+			Type:      "user",
+			URL:       userURL,
+			Login:     login,
+			Name:      name,
+			Emails:    []data.Email{},
+			CreatedAt: formatDateToZ(time.Now().Format(time.RFC3339)),
+		}
+		c.logger.Debug("Discovered inactive user — using nickname-based URL",
+			zap.String("uuid", cleanUUID),
+			zap.String("nickname", login),
+			zap.String("url", userURL))
+	}
+
+	return userURL
+}
+
+// GetInactiveUsers returns all users discovered during PR/comment processing
+// whose UUID was not found in the active workspace member list.  The exporter
+// should merge these into users_000001.json after all PR data is fetched.
+func (c *Client) GetInactiveUsers() []data.User {
+	users := make([]data.User, 0, len(c.inactiveUsers))
+	for _, u := range c.inactiveUsers {
+		users = append(users, u)
+	}
+	return users
 }
 
 func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, prsFromDate string) ([]data.PullRequest, error) {
@@ -422,7 +568,7 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 			}
 
 			prURL := formatURL("pr", workspace, repoSlug, pr.ID)
-			userURL := formatURL("user", workspace, "", strings.Trim(pr.Author.UUID, "{}"))
+			userURL := c.resolveUserURL(workspace, pr.Author.UUID, pr.Author.Nickname, pr.Author.DisplayName)
 			repoURL := formatURL("repository", workspace, repoSlug)
 			prUser := formatURL("user", workspace, "")
 
@@ -430,16 +576,131 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 			baseSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Destination.Commit.Hash)
 			headSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.Source.Commit.Hash)
 
-			description := ""
-			if pr.Description != nil {
-				description = *pr.Description
+			// A 40-char SHA returned by the Bitbucket API is not necessarily
+			// present in the local clone: the commit may have been GC'd on
+			// Bitbucket's side after our clone was made.  GEI would fail with
+			// REF_NOT_FOUND because the object doesn't exist in the imported repo.
+			// Reset to "" so the fallback logic below treats it as unresolvable.
+			if len(baseSHA) == 40 && !c.localCommitExists(workspace, repoSlug, baseSHA) {
+				c.logger.Debug("baseSHA not present in local clone — treating as unresolvable for fallback",
+					zap.Int("pr_id", pr.ID),
+					zap.String("sha", baseSHA))
+				baseSHA = ""
+			}
+			if len(headSHA) == 40 && !c.localCommitExists(workspace, repoSlug, headSHA) {
+				c.logger.Debug("headSHA not present in local clone — treating as unresolvable for fallback",
+					zap.Int("pr_id", pr.ID),
+					zap.String("sha", headSHA))
+				headSHA = ""
 			}
 
-			// Format merge commit SHA if available
+			// Format merge commit SHA if available.  This must be resolved before
+			// the headSHA fallback below so it can be used as the fallback value.
+			// If the merge commit is unresolvable (short SHA or absent from local
+			// clone), leave the pointer nil rather than storing a dangling reference.
 			var mergeCommitSHA *string
 			if pr.MergeCommit != nil && pr.State == "MERGED" {
 				fullMergeSHA, _ := c.GetFullCommitSHA(workspace, repoSlug, pr.MergeCommit.Hash)
-				mergeCommitSHA = &fullMergeSHA
+				if len(fullMergeSHA) == 40 && c.localCommitExists(workspace, repoSlug, fullMergeSHA) {
+					mergeCommitSHA = &fullMergeSHA
+				} else {
+					c.logger.Debug("merge commit SHA unresolvable or absent from local clone — omitting from export",
+						zap.Int("pr_id", pr.ID),
+						zap.String("sha", fullMergeSHA))
+				}
+			}
+
+			// Source-branch and base-branch commits are sometimes inaccessible on
+			// old PRs (branch deleted + objects GC'd).  A SHA shorter than 40
+			// chars means GetFullCommitSHA couldn't resolve it.  GEI silently
+			// drops any PR whose head or base SHA is not a valid 40-char value.
+			//
+			// Behaviour is controlled by --sha-fallback:
+			//   "none"    — no substitution; pass short SHAs through as-is
+			//   "related" — headSHA: try merge commit SHA (MERGED), then baseSHA
+			//               baseSHA: try headSHA (once resolved), then nearest
+			//   "nearest" — all of "related", then fall back to the nearest/oldest
+			//               commit on the destination branch from the local clone
+
+			// ── headSHA fallback ────────────────────────────────────────────────
+			if c.shaFallback != "none" && len(headSHA) < 40 {
+				original := headSHA
+				if mergeCommitSHA != nil && len(*mergeCommitSHA) == 40 {
+					headSHA = *mergeCommitSHA
+					c.logger.Info("PR head SHA unresolvable — substituted merge commit SHA",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("fallback_sha", headSHA))
+				} else if len(baseSHA) == 40 {
+					headSHA = baseSHA
+					c.logger.Info("PR head SHA unresolvable — substituted base branch SHA",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("fallback_sha", headSHA))
+				} else if c.shaFallback == "nearest" {
+					nearestSHA := c.getNearestCommitSHA(workspace, repoSlug,
+						pr.Destination.Branch.Name, pr.CreatedOn)
+					if nearestSHA != "" {
+						headSHA = nearestSHA
+						c.logger.Info("PR head SHA unresolvable — substituted nearest local commit",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("destination_branch", pr.Destination.Branch.Name),
+							zap.String("fallback_sha", headSHA))
+					} else {
+						c.logger.Warn("PR has no resolvable head SHA — GEI may skip it",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("sha_fallback", c.shaFallback))
+					}
+				} else {
+					c.logger.Warn("PR has no resolvable head SHA — GEI may skip it",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("sha_fallback", c.shaFallback))
+				}
+			}
+
+			// ── baseSHA fallback ────────────────────────────────────────────────
+			// baseSHA must also be a full 40-char value.  Old destination-branch
+			// history can be GC'd just as source-branch history can be.
+			if c.shaFallback != "none" && len(baseSHA) < 40 {
+				original := baseSHA
+				if len(headSHA) == 40 {
+					// headSHA is already anchored (original or via fallback above);
+					// using it for base is imprecise but keeps the PR importable.
+					baseSHA = headSHA
+					c.logger.Info("PR base SHA unresolvable — substituted resolved head SHA",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("fallback_sha", baseSHA))
+				} else if c.shaFallback == "nearest" {
+					nearestSHA := c.getNearestCommitSHA(workspace, repoSlug,
+						pr.Destination.Branch.Name, pr.CreatedOn)
+					if nearestSHA != "" {
+						baseSHA = nearestSHA
+						c.logger.Info("PR base SHA unresolvable — substituted nearest local commit",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("destination_branch", pr.Destination.Branch.Name),
+							zap.String("fallback_sha", baseSHA))
+					} else {
+						c.logger.Warn("PR has no resolvable base SHA — GEI may skip it",
+							zap.Int("pr_id", pr.ID),
+							zap.String("original_sha", original),
+							zap.String("sha_fallback", c.shaFallback))
+					}
+				} else {
+					c.logger.Warn("PR has no resolvable base SHA — GEI may skip it",
+						zap.Int("pr_id", pr.ID),
+						zap.String("original_sha", original),
+						zap.String("sha_fallback", c.shaFallback))
+				}
+			}
+
+			description := "📜 _Migrated from Bitbucket: this pull request was opened without a description._"
+			if pr.Description != nil && strings.TrimSpace(*pr.Description) != "" {
+				description = *pr.Description
 			}
 
 			// Create the Pull Request with GitHub-compatible structure
@@ -477,6 +738,13 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 			}
 
 			pullRequests = append(pullRequests, pullRequest)
+
+			// Cache the embedded participants so GetPullRequestApprovals can
+			// read them without needing a separate /participants API call.
+			// Guard against nil map for tests that use &Client{} directly.
+			if len(pr.Participants) > 0 && c.prParticipantsCache != nil {
+				c.prParticipantsCache[prURL] = pr.Participants
+			}
 		}
 
 		hasMore = response.Next != ""
@@ -491,6 +759,20 @@ func (c *Client) GetPullRequests(workspace, repoSlug string, openPRsOnly bool, p
 		zap.Int("skipped_by_date", skippedByDate))
 
 	return pullRequests, nil
+}
+
+// localCommitExists reports whether sha is a reachable object in the
+// locally-cloned bare repository.  It is used to detect the case where the
+// Bitbucket API returns a valid 40-char SHA for a commit that was GC'd on
+// Bitbucket's side before our clone was made — the object is absent from the
+// clone, and therefore from the GitHub repo that GEI creates, causing a
+// REF_NOT_FOUND error at import time.
+func (c *Client) localCommitExists(workspace, repoSlug, sha string) bool {
+	if len(sha) != 40 {
+		return false
+	}
+	repoPath := filepath.Join(c.exportDir, "repositories", workspace, repoSlug+".git")
+	return exec.Command("git", "--git-dir", repoPath, "cat-file", "-t", sha).Run() == nil
 }
 
 func (c *Client) GetFullCommitSHA(workspace, repoSlug, commitHash string) (string, error) {
@@ -558,6 +840,7 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 
 	prURLMap := make(map[int]string)
 	prCommitMap := make(map[int]string)
+	prAuthorMap := make(map[int]string) // prID → author UUID (stripped of braces)
 
 	for _, pr := range pullRequests {
 		parts := strings.Split(pr.URL, "/")
@@ -566,6 +849,10 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 			if err == nil {
 				prURLMap[prID] = pr.URL
 				prCommitMap[prID] = pr.Head.SHA
+				// pr.User is the GEI-format URL: "https://bitbucket.org/{uuid}"
+			// Extract the UUID from the last path segment.
+			userParts := strings.Split(pr.User, "/")
+			prAuthorMap[prID] = userParts[len(userParts)-1]
 			}
 		}
 	}
@@ -602,7 +889,17 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 			for _, comment := range response.Values {
 				createdAt := formatDateToZ(comment.CreatedOn)
 				updatedAt := formatDateToZ(comment.UpdatedOn)
-				transformedBody := c.transformCommentBody(comment.Content.Raw, workspace, repoSlug)
+
+				rawBody := strings.TrimSpace(comment.Content.Raw)
+				if rawBody == "" {
+					commentorUUID := strings.Trim(comment.User.UUID, "{}")
+					if commentorUUID == prAuthorMap[prID] {
+						rawBody = "📜 _Migrated from Bitbucket: pull request opened without a description._"
+					} else {
+						rawBody = "📜 _Migrated from Bitbucket: this comment had no content._"
+					}
+				}
+				transformedBody := c.transformCommentBody(rawBody, workspace, repoSlug)
 				prNumber := fmt.Sprintf("%d", prID)
 
 				if comment.Inline != nil && comment.Inline.Path != "" {
@@ -654,7 +951,7 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 					reviewURL := formatURL("pr_review", workspace, repoSlug, prNumber, reviewId)
 					threadURL := formatURL("pr_review_thread", workspace, repoSlug, prNumber, threadId)
 					prFullURL := formatURL("pr", workspace, repoSlug, prNumber)
-					userURL := formatURL("user", workspace, "", strings.Trim(comment.User.UUID, "{}"))
+					userURL := c.resolveUserURL(workspace, comment.User.UUID, comment.User.Nickname, comment.User.DisplayName)
 					commitSHA := prCommitMap[prID]
 
 					// Create diff hunk
@@ -678,7 +975,7 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 						UpdatedAt:               updatedAt,
 						Formatter:               "markdown",
 						DiffHunk:                diffHunk,
-						State:                   1,
+						State:                   1, // GEI integer state for an active review comment (not the same schema as pull_request_reviews string state)
 						InReplyTo:               inReplyTo,
 						Reactions:               []string{},
 						SubjectType:             "line",
@@ -688,7 +985,7 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 				} else {
 					commentURL := formatURL("issue_comment", workspace, repoSlug, prNumber, comment.ID)
 					prURL := formatURL("pr", workspace, repoSlug, prNumber)
-					userURL := formatURL("user", workspace, "", strings.Trim(comment.User.UUID, "{}"))
+					userURL := c.resolveUserURL(workspace, comment.User.UUID, comment.User.Nickname, comment.User.DisplayName)
 
 					regularComment := data.IssueComment{
 						Type:        "issue_comment",
@@ -719,6 +1016,463 @@ func (c *Client) GetPullRequestComments(workspace, repoSlug string, pullRequests
 
 	return regularComments, reviewComments, nil
 }
+
+
+// GetPullRequestApprovals fetches approval reviews and builds a migration
+// summary comment for each PR.  Both are returned to the caller so they can be
+// written to the appropriate archive files.
+//
+// reviews        → pull_request_reviews_000001.json  (COMMENTED state)
+// summaryComments → issue_comments_000001.json        (migration summary)
+func (c *Client) GetPullRequestApprovals(workspace, repoSlug string, pullRequests []data.PullRequest) (
+	reviews []map[string]interface{},
+	summaryComments []data.IssueComment,
+	err error,
+) {
+	c.logger.Info("Fetching pull request approvals via PR detail endpoint")
+
+	for _, pr := range pullRequests {
+		parts := strings.Split(pr.URL, "/")
+		if len(parts) == 0 {
+			continue
+		}
+		prNumber := parts[len(parts)-1]
+
+		// ── Primary: fetch the full PR detail — this includes participants ─────
+		// The list endpoint omits participants; the detail endpoint includes them.
+		endpoint := fmt.Sprintf("repositories/%s/%s/pullrequests/%s",
+			workspace, repoSlug, prNumber)
+
+		var prDetail data.BitbucketPR
+		if fetchErr := c.makeRequest("GET", endpoint, &prDetail); fetchErr != nil {
+			c.logger.Warn("Failed to fetch PR detail for approval data, will try cache",
+				zap.String("pr", prNumber),
+				zap.Error(fetchErr))
+		} else {
+			c.logger.Debug("PR detail participants",
+				zap.String("pr", prNumber),
+				zap.Int("count", len(prDetail.Participants)))
+
+			for _, p := range prDetail.Participants {
+				c.logger.Debug("Participant",
+					zap.String("pr", prNumber),
+					zap.String("user", p.User.UUID),
+					zap.Bool("approved", p.Approved),
+					zap.String("state", p.State))
+				if !p.Approved {
+					continue
+				}
+				review := c.buildApprovalReview(workspace, repoSlug, prNumber, pr, p)
+				reviews = append(reviews, review)
+			}
+
+			// Fetch the PR commit timeline for the post-approval SOC2 check.
+			commitDates := c.getPRCommits(workspace, repoSlug, prNumber)
+
+			// Build the migration summary comment using the full PR detail.
+			summary := c.buildMigrationSummaryComment(
+				workspace, repoSlug, prNumber,
+				pr, prDetail.Author.DisplayName, prDetail.Participants, commitDates,
+			)
+			summaryComments = append(summaryComments, summary)
+			continue
+		}
+
+		// ── Fallback: embedded participants cached during GetPullRequests ──────
+		// Only reached when the PR detail fetch above failed entirely.
+		cached, hasCached := c.prParticipantsCache[pr.URL]
+		if !hasCached {
+			c.logger.Debug("No participants available for PR (detail fetch failed, no cache)",
+				zap.String("pr", prNumber))
+		} else {
+			c.logger.Debug("Using cached embedded participants as fallback",
+				zap.String("pr", prNumber),
+				zap.Int("count", len(cached)))
+			for _, p := range cached {
+				if !p.Approved {
+					continue
+				}
+				review := c.buildApprovalReview(workspace, repoSlug, prNumber, pr, p)
+				reviews = append(reviews, review)
+			}
+		}
+
+		// For the summary comment in the fallback path, use the UUID extracted
+		// from pr.User as the author display name (best effort).
+		// Commit timeline is not fetched here — the PR detail call already failed.
+		authorParts := strings.Split(pr.User, "/")
+		authorName := authorParts[len(authorParts)-1]
+		summary := c.buildMigrationSummaryComment(
+			workspace, repoSlug, prNumber,
+			pr, authorName, cached, nil,
+		)
+		summaryComments = append(summaryComments, summary)
+	}
+
+	c.logger.Info("Pull request approvals fetched",
+		zap.Int("reviews", len(reviews)),
+		zap.Int("summary_comments", len(summaryComments)))
+	return reviews, summaryComments, nil
+}
+
+// approvalHashID derives a stable decimal numeric ID from a seed string using
+// FNV-32a, producing an integer that looks like a real Bitbucket record ID.
+// GEI may parse URL fragments to extract numeric identifiers, so approval
+// review/comment/thread URLs must use the same format as real IDs.
+func approvalHashID(seed string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(seed))
+	return h.Sum32()
+}
+
+// buildApprovalReview converts a single approved Bitbucket participant into the
+// GitHub-format pull_request_review map expected by the GEI importer.
+func (c *Client) buildApprovalReview(workspace, repoSlug, prNumber string,
+	pr data.PullRequest, p data.BitbucketParticipant) map[string]interface{} {
+
+	userURL := c.resolveUserURL(workspace, p.User.UUID, p.User.Nickname, p.User.DisplayName)
+	prURL := formatURL("pr", workspace, repoSlug, prNumber)
+	uuid := strings.Trim(p.User.UUID, "{}")
+
+	// Use the "review-{numericID}" prefix format that createReviews uses for inline
+	// comment reviews.  Real inline reviews produce URLs like:
+	//   #pullrequestreview-review-57304971
+	// GEI may only recognise pull_request_review entries whose URL fragment matches
+	// this pattern; entries with just a bare numeric ID are silently dropped.
+	reviewNumID := approvalHashID(fmt.Sprintf("approval-review-%s-%s-%s-%s", workspace, repoSlug, prNumber, uuid))
+	reviewURL := formatURL("pr_review", workspace, repoSlug, prNumber, fmt.Sprintf("review-%d", reviewNumID))
+
+	participatedAt := p.ParticipatedOn
+	if participatedAt == "" {
+		if pr.MergedAt != nil && *pr.MergedAt != "" {
+			participatedAt = *pr.MergedAt
+		} else {
+			participatedAt = pr.CreatedAt
+		}
+	} else {
+		participatedAt = formatDateToZ(participatedAt)
+	}
+
+	return map[string]interface{}{
+		"type":         "pull_request_review",
+		"url":          reviewURL,
+		"pull_request": prURL,
+		"user":         userURL,
+		"body":         "📜 _Migrated from Bitbucket: this PR was approved before migration to GitHub._",
+		"head_sha":     pr.Head.SHA,
+		"formatter":    "markdown",
+		// GEI integer state for pull_request_review.
+		// 1=COMMENTED is the only state GEI accepts via archive import.
+		// States 2 and 3 (APPROVED, CHANGES_REQUESTED) are silently dropped — likely
+		// an intentional GEI policy to prevent bypassing branch protection requirements.
+		"state":        1,
+		"reactions":    []interface{}{},
+		"created_at":   participatedAt,
+		"submitted_at": participatedAt,
+	}
+}
+
+
+// formatDateOnly returns just the YYYY-MM-DD portion of any timestamp that
+// formatDateToZ can parse, making it safe to use with Bitbucket or GEI dates.
+func formatDateOnly(ts string) string {
+	normalised := formatDateToZ(ts)
+	if len(normalised) >= 10 {
+		return normalised[:10]
+	}
+	if len(ts) >= 10 {
+		return ts[:10] // best-effort fallback
+	}
+	return ts
+}
+
+// getPRCommits fetches all commit timestamps for a PR from
+// /repositories/{ws}/{repo}/pullrequests/{id}/commits.
+//
+// Commits are returned newest-first by the API; we collect all timestamps so
+// the caller can find the most recent one and count those that landed after a
+// given approval time.  Returns nil (not an error) on any API failure so the
+// caller can degrade gracefully.
+func (c *Client) getPRCommits(workspace, repoSlug, prNumber string) []time.Time {
+	var dates []time.Time
+	endpoint := fmt.Sprintf("repositories/%s/%s/pullrequests/%s/commits?pagelen=50",
+		workspace, repoSlug, prNumber)
+
+	for endpoint != "" {
+		var resp data.BitbucketPRCommitsResponse
+		if err := c.makeRequest("GET", endpoint, &resp); err != nil {
+			// A 404 here almost always means the source branch was deleted
+			// after merge — the commits endpoint requires both ends of the PR
+			// to still exist.  This is expected for old PRs; the consequence
+			// is that the post-approval timeline is omitted from the migration
+			// summary comment for this PR.
+			c.logger.Info("getPRCommits: commit timeline unavailable (source branch likely deleted) — timeline section omitted from migration summary",
+				zap.String("pr", prNumber))
+			return nil
+		}
+		for _, commit := range resp.Values {
+			if t, err := time.Parse(time.RFC3339, commit.Date); err == nil {
+				dates = append(dates, t)
+			} else {
+				c.logger.Debug("getPRCommits: skipping unparseable commit date",
+					zap.String("hash", commit.Hash),
+					zap.String("date", commit.Date))
+			}
+		}
+		endpoint = resp.Next
+	}
+	return dates
+}
+
+// buildMigrationSummaryComment produces an issue_comment that summarises a
+// migrated pull request: who opened it, who approved or requested changes, and
+// when it was closed or merged.
+//
+// The comment is attributed to the workspace user URL so it appears under a
+// clearly identifiable migration mannequin rather than any real participant.
+// Once GEI has created the mannequin it can be reclaimed or left as-is.
+func (c *Client) buildMigrationSummaryComment(
+	workspace, repoSlug, prNumber string,
+	pr data.PullRequest,
+	authorDisplayName string,
+	participants []data.BitbucketParticipant,
+	commitDates []time.Time,
+) data.IssueComment {
+
+	openDate := formatDateOnly(pr.CreatedAt)
+
+	// Collect approval and needs-work participants, skipping the PR author.
+	// Track the latest approval timestamp for the post-approval commit check.
+	var approvers []string
+	var changesRequested []string
+	var lastApprovalTime *time.Time
+	for _, p := range participants {
+		if p.Role == "AUTHOR" {
+			continue
+		}
+		name := p.User.DisplayName
+		if name == "" {
+			name = strings.Trim(p.User.UUID, "{}")
+		}
+		if p.Approved {
+			date := formatDateOnly(p.ParticipatedOn)
+			if date != "" {
+				approvers = append(approvers, fmt.Sprintf("%s (%s)", name, date))
+			} else {
+				approvers = append(approvers, name)
+			}
+			// Track the most recent approval time for the commit-timeline check.
+			if t, err := time.Parse(time.RFC3339, p.ParticipatedOn); err == nil {
+				if lastApprovalTime == nil || t.After(*lastApprovalTime) {
+					lastApprovalTime = &t
+				}
+			}
+		} else if p.State == "changes_requested" || p.State == "needs_work" {
+			changesRequested = append(changesRequested, name)
+		}
+	}
+
+	// Build the comment body.  Two trailing spaces force a GitHub line-break.
+	var lines []string
+	lines = append(lines, "📜 **Bitbucket Pull Request Migration Summary**\n")
+
+	author := authorDisplayName
+	if author == "" {
+		// Extract UUID from URL as a last resort
+		parts := strings.Split(pr.User, "/")
+		author = parts[len(parts)-1]
+	}
+	lines = append(lines, fmt.Sprintf("**Opened:** %s by %s", openDate, author))
+
+	if len(approvers) > 0 {
+		lines = append(lines, fmt.Sprintf("**Approved by:** %s", strings.Join(approvers, ", ")))
+	} else {
+		lines = append(lines, "**Approved by:** _(none)_")
+	}
+	if len(changesRequested) > 0 {
+		lines = append(lines, fmt.Sprintf("**Changes requested by:** %s", strings.Join(changesRequested, ", ")))
+	}
+
+	// ── Post-approval commit timeline (SOC2 compliance signal) ───────────
+	// Only shown when we have at least one parseable approval time and commit
+	// data was successfully fetched.  A ⚠️ means commits landed after the
+	// last approval — the reviewer saw a different version than what merged.
+	if lastApprovalTime != nil && commitDates != nil {
+		var commitsAfter int
+		var lastCommitTime time.Time
+		for _, ct := range commitDates {
+			if ct.After(*lastApprovalTime) {
+				commitsAfter++
+			}
+			if ct.After(lastCommitTime) {
+				lastCommitTime = ct
+			}
+		}
+		if commitsAfter == 0 {
+			lines = append(lines, "**Commits after last approval:** none ✅")
+		} else {
+			lines = append(lines, fmt.Sprintf(
+				"**Commits after last approval:** %d ⚠️  (last approval: %s, last commit: %s)",
+				commitsAfter,
+				formatDateOnly(lastApprovalTime.Format(time.RFC3339)),
+				formatDateOnly(lastCommitTime.Format(time.RFC3339)),
+			))
+		}
+	}
+
+	if pr.MergedAt != nil && *pr.MergedAt != "" {
+		lines = append(lines, fmt.Sprintf("**Merged:** %s", formatDateOnly(*pr.MergedAt)))
+	} else if pr.ClosedAt != nil && *pr.ClosedAt != "" {
+		lines = append(lines, fmt.Sprintf("**Closed:** %s", formatDateOnly(*pr.ClosedAt)))
+	} else {
+		lines = append(lines, "**Status:** Open at time of migration")
+	}
+
+	body := strings.Join(lines, "  \n")
+
+	// Pin the comment 1 second after close/merge so it appears at the bottom
+	// of the PR timeline.
+	commentTime := pr.CreatedAt
+	if pr.MergedAt != nil && *pr.MergedAt != "" {
+		commentTime = *pr.MergedAt
+	} else if pr.ClosedAt != nil && *pr.ClosedAt != "" {
+		commentTime = *pr.ClosedAt
+	}
+	if t, parseErr := time.Parse(time.RFC3339, commentTime); parseErr == nil {
+		commentTime = formatDateToZ(t.Add(time.Second).Format(time.RFC3339))
+	}
+
+	// Stable unique ID for the comment URL so re-runs don't produce duplicates.
+	seed := fmt.Sprintf("summary-%s-%s-%s", workspace, repoSlug, prNumber)
+	commentID := approvalHashID(seed)
+
+	prURL := formatURL("pr", workspace, repoSlug, prNumber)
+	commentURL := formatURL("issue_comment", workspace, repoSlug, prNumber, commentID)
+
+	// Attribute to the workspace system user — this becomes a mannequin
+	// clearly named after the workspace, marking it as a migration artefact.
+	userURL := fmt.Sprintf("https://bitbucket.org/%s", workspace)
+
+	return data.IssueComment{
+		Type:        "issue_comment",
+		URL:         commentURL,
+		User:        userURL,
+		Body:        body,
+		CreatedAt:   commentTime,
+		Formatter:   "markdown",
+		Reactions:   []string{},
+		PullRequest: prURL,
+	}
+}
+
+// getNearestCommitSHA returns the full 40-char SHA of the most recent commit
+// on branchName that was created at or before beforeDate (RFC3339 / ISO-8601).
+// It uses the bare git repo already cloned into the export directory.
+// Returns "" if the repo is not found, the branch has no commits before that
+// date, or any git command fails.
+func (c *Client) getNearestCommitSHA(workspace, repoSlug, branchName, beforeDate string) string {
+	repoPath := filepath.Join(c.exportDir, "repositories", workspace, repoSlug+".git")
+	if _, err := os.Stat(repoPath); err != nil {
+		c.logger.Debug("getNearestCommitSHA: local git repo not found",
+			zap.String("path", repoPath))
+		return ""
+	}
+
+	// Normalise the date to a format git accepts (YYYY-MM-DD is fine).
+	dateStr := formatDateOnly(beforeDate)
+
+	// Try several ref forms — the bare clone may use heads/ or remotes/origin/.
+	refs := []string{
+		"refs/heads/" + branchName,
+		"refs/remotes/origin/" + branchName,
+		branchName,
+	}
+
+	for _, ref := range refs {
+		out, err := exec.Command(
+			"git", "--git-dir", repoPath,
+			"log", "--before="+dateStr, "--format=%H", ref,
+		).Output()
+		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+			continue
+		}
+		// First line is the most recent commit on or before the date.
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) > 0 && len(lines[0]) == 40 {
+			return lines[0]
+		}
+	}
+
+	// No commit predates the PR's open date — the clone's history doesn't reach
+	// that far back (objects GC'd on Bitbucket's side before the clone was made).
+	// Fall back to the oldest available commit on the branch: it is at least the
+	// closest surviving ancestor, and GEI will accept any valid 40-char SHA.
+	c.logger.Debug("getNearestCommitSHA: no commit found before date, trying oldest commit on branch",
+		zap.String("branch", branchName),
+		zap.String("before", dateStr))
+
+	for _, ref := range refs {
+		out, err := exec.Command(
+			"git", "--git-dir", repoPath,
+			"log", "--reverse", "--format=%H", ref,
+		).Output()
+		if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+			continue
+		}
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) > 0 && len(lines[0]) == 40 {
+			c.logger.Debug("getNearestCommitSHA: using oldest available commit as fallback",
+				zap.String("branch", branchName),
+				zap.String("sha", lines[0]))
+			return lines[0]
+		}
+	}
+
+	// ── Last resort: branch no longer exists in the clone ──────────────────
+	// The destination branch was deleted and its objects GC'd (common when a
+	// PR targeted another topic branch that was itself later merged).  Search
+	// across ALL refs for the most recent commit that predates the PR's open
+	// date.  This is historically approximate but always yields a valid
+	// 40-char SHA, which is what GEI needs to anchor the PR.
+	c.logger.Debug("getNearestCommitSHA: branch not found in clone, falling back to all-refs search",
+		zap.String("branch", branchName),
+		zap.String("before", dateStr))
+
+	out, err := exec.Command(
+		"git", "--git-dir", repoPath,
+		"log", "--all", "--before="+dateStr, "--format=%H", "-1",
+	).Output()
+	if err == nil {
+		sha := strings.TrimSpace(string(out))
+		if len(sha) == 40 {
+			c.logger.Warn("getNearestCommitSHA: destination branch gone — anchoring to nearest commit across all refs (historically approximate)",
+				zap.String("missing_branch", branchName),
+				zap.String("before", dateStr),
+				zap.String("fallback_sha", sha))
+			return sha
+		}
+	}
+
+	// Absolute last resort: oldest commit anywhere in the repo.
+	out, err = exec.Command(
+		"git", "--git-dir", repoPath,
+		"log", "--all", "--reverse", "--format=%H", "-1",
+	).Output()
+	if err == nil {
+		sha := strings.TrimSpace(string(out))
+		if len(sha) == 40 {
+			c.logger.Warn("getNearestCommitSHA: no commit predates PR open date — using oldest commit in repo",
+				zap.String("missing_branch", branchName),
+				zap.String("fallback_sha", sha))
+			return sha
+		}
+	}
+
+	c.logger.Debug("getNearestCommitSHA: branch has no resolvable commits",
+		zap.String("branch", branchName))
+	return ""
+}
+
 
 func (c *Client) transformCommentBody(body, workspace, repoSlug string) string {
 	if body == "" {

@@ -359,6 +359,19 @@ func ValidateExportFlags(cmdFlags *data.CmdExportFlags) error {
 		}
 	}
 
+	// Validate SHAFallback value.  Empty string is normalised to the default
+	// so that callers that build CmdExportFlags programmatically (e.g. tests)
+	// don't have to set this field explicitly.
+	if cmdFlags.SHAFallback == "" {
+		cmdFlags.SHAFallback = "related"
+	}
+	switch cmdFlags.SHAFallback {
+	case "none", "related", "nearest":
+		// valid
+	default:
+		return fmt.Errorf("invalid value %q for --sha-fallback: must be one of: none, related, nearest", cmdFlags.SHAFallback)
+	}
+
 	return nil
 }
 
@@ -639,14 +652,23 @@ func (e *Exporter) validateGitReferences(repoPath string) error {
 		}
 	}
 
-	// 6. Check for duplicate reference names across different types
+	// 6. Check for duplicate reference names across different types (e.g. a branch and
+	// tag sharing the same name).  With --allow-ambiguous-refs this becomes a warning
+	// rather than a hard failure — Git and GitHub can handle it, but checkout behaviour
+	// will differ from Bitbucket (branches take precedence over tags of the same name).
 	for name, types := range refNameMap {
 		if len(types) > 1 {
-			ambiguousRefs = append(ambiguousRefs, fmt.Sprintf("ambiguous reference '%s' exists as both %s",
-				name, strings.Join(types, " and ")))
-			e.logger.Error("Found name used for multiple reference types",
-				zap.String("name", name),
-				zap.Strings("types", types))
+			if e.allowAmbiguousRefs {
+				e.logger.Warn("Reference name exists as both branch and tag — behaviour may differ from Bitbucket (branch takes precedence); proceeding because --allow-ambiguous-refs is set",
+					zap.String("name", name),
+					zap.Strings("types", types))
+			} else {
+				ambiguousRefs = append(ambiguousRefs, fmt.Sprintf("ambiguous reference '%s' exists as both %s",
+					name, strings.Join(types, " and ")))
+				e.logger.Error("Found name used for multiple reference types",
+					zap.String("name", name),
+					zap.Strings("types", types))
+			}
 		}
 	}
 
